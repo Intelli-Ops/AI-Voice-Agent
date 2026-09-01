@@ -131,6 +131,11 @@ def _load_results() -> dict:
     return {}
 
 
+def clear_results():
+    if RESULTS_FILE.exists():
+        RESULTS_FILE.unlink()
+
+
 def _save(field_name: str, value: str):
     results = _load_results()
     results[field_name] = {"value": value, "captured_at": datetime.now(timezone.utc).isoformat()}
@@ -215,7 +220,9 @@ class ContextTrimmer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def main():
+async def run_call(on_runner_ready=None):
+    """Build and run the agent pipeline. Pass on_runner_ready(runner) to grab
+    a handle for ending the call early (e.g. from a web UI)."""
     deepgram_key = os.getenv("DEEPGRAM_API_KEY")
     groq_key = os.getenv("GROQ_API_KEY")
     cartesia_key = os.getenv("CARTESIA_API_KEY")
@@ -309,11 +316,19 @@ async def main():
     runner = WorkerRunner()
     await runner.add_workers(task)
 
+    if on_runner_ready:
+        on_runner_ready(runner)
+
     # Kick the agent off -- it opens the call itself, per the script.
     await task.queue_frames([LLMRunFrame()])
 
     print("\n=== Voice agent running. Speak into your mic to play the insurance rep. Ctrl+C to stop. ===\n")
     await runner.run()
+
+
+async def main():
+    clear_results()
+    await run_call()
 
 
 if __name__ == "__main__":
