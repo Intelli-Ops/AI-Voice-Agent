@@ -1,0 +1,22 @@
+# Environment variables and secrets
+.env
+*.env
+
+# Python virtual environments and caches
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Local runtime logs and data
+call_results.json
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
