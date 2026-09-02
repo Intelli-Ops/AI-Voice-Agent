@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from loguru import logger
+from openai import AsyncOpenAI
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -93,8 +95,13 @@ Date of injury (DOI): {CLAIM_CONTEXT["doi"]}
 Patient / claimant name: {CLAIM_CONTEXT["patient_name"]}
 
 TOOL USE
-Whenever the rep confirms a field, immediately call save_field with the
-exact value given -- don't wait until the end of the call.
+Whenever the rep confirms a field, ALWAYS immediately call save_field (or
+save_adjuster_info) with the exact value given -- this must happen every
+single time a field is confirmed, don't wait until the end of the call, and
+don't skip it. Saving the data correctly matters more than anything else in
+this call. Confirming the value back to the rep (e.g. "Got it, XYZ-456789")
+already happens naturally as part of the GOAL instructions below -- that's
+enough, don't add any extra narration about writing or noting things down.
 For the adjuster's contact details (field 3: name, phone, email, fax),
 use save_adjuster_info with all the pieces you have together in ONE call --
 don't call it separately for each piece, since the rep will usually give
@@ -194,25 +201,85 @@ save_adjuster_info_schema = FunctionSchema(
 class ContextTrimmer(FrameProcessor):
     """Caps context sent to the LLM so per-turn latency stays flat as the call goes on.
 
-    Keeps the system prompt plus only the most recent messages, always cutting
-    at a user-turn boundary so a tool_call/tool-result pair never gets split.
+    Keeps the system prompt, a running summary of everything older, and only
+    the most recent messages -- always cutting at a user-turn boundary so a
+    tool_call/tool-result pair never gets split. When the window overflows,
+    the dropped messages are summarized in the background (a separate, cheap
+    Groq call that doesn't block the live turn) instead of just being thrown
+    away, so the agent keeps some memory of the earlier part of the call.
     """
 
-    def __init__(self, context: LLMContext, max_history_messages: int = 16, **kwargs):
+    def __init__(
+        self,
+        context: LLMContext,
+        groq_api_key: str,
+        max_history_messages: int = 16,
+        summarizer_model: str = "qwen/qwen3.8-27b",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._context = context
         self._max = max_history_messages
+        self._summary = ""
+        self._summarizing = False
+        self._summarizer_model = summarizer_model
+        self._client = AsyncOpenAI(api_key=groq_api_key, base_url="https://api.groq.com/openai/v1")
 
     def _trim(self, messages: list) -> list:
         if len(messages) <= 1:
             return messages
         system_msg, rest = messages[0], messages[1:]
+
+        summary_msg = (
+            [{"role": "system", "content": f"Summary of the call so far: {self._summary}"}]
+            if self._summary
+            else []
+        )
+
         if len(rest) <= self._max:
-            return messages
+            return [system_msg] + summary_msg + rest
+
         cut = len(rest) - self._max
         while cut < len(rest) and rest[cut].get("role") != "user":
             cut += 1
-        return [system_msg] + rest[cut:]
+        dropped, kept = rest[:cut], rest[cut:]
+
+        if dropped and not self._summarizing:
+            asyncio.create_task(self._summarize(dropped))
+
+        return [system_msg] + summary_msg + kept
+
+    async def _summarize(self, dropped_messages: list):
+        lines = [
+            f"{m['role']}: {m['content']}"
+            for m in dropped_messages
+            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m["content"]
+        ]
+        if not lines:
+            return
+
+        self._summarizing = True
+        try:
+            resp = await self._client.chat.completions.create(
+                model=self._summarizer_model,
+                temperature=0,
+                max_completion_tokens=60,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Summarize this segment of a phone call in ONE short sentence. "
+                        "Keep only concrete facts stated (names, numbers, confirmations). No preamble.",
+                    },
+                    {"role": "user", "content": "\n".join(lines)},
+                ],
+            )
+            new_bit = (resp.choices[0].message.content or "").strip()
+            if new_bit:
+                self._summary = f"{self._summary} {new_bit}".strip()
+        except Exception as exc:
+            logger.warning(f"ContextTrimmer: background summarization failed: {exc}")
+        finally:
+            self._summarizing = False
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -288,7 +355,7 @@ async def run_call(on_runner_ready=None):
         ),
     )
 
-    context_trimmer = ContextTrimmer(context, max_history_messages=16)
+    context_trimmer = ContextTrimmer(context, groq_api_key=groq_key, max_history_messages=16)
 
     pipeline = Pipeline(
         [
