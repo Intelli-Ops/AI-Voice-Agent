@@ -11,12 +11,14 @@ Then open http://localhost:8000
 
 import asyncio
 import json
+import os
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+from twilio.rest import Client as TwilioClient
 
-from main import CLAIM_CONTEXT, RESULTS_FILE, clear_results, run_call
+from main import CLAIM_CONTEXT, RESULTS_FILE, clear_results, run_call, run_call_twilio
 
 app = FastAPI()
 
@@ -25,6 +27,7 @@ state = {
     "runner": None,
     "task": None,
     "destination_number": None,
+    "extension": "",
     "error": None,
 }
 
@@ -40,6 +43,7 @@ FIELD_LABELS = {
 
 class StartCallRequest(BaseModel):
     destination_number: str = ""
+    extension: str = ""
 
 
 async def _run_call_bg():
@@ -74,6 +78,96 @@ async def end_call():
     if state["runner"] is not None:
         await state["runner"].end()
     return {"status": "ending"}
+
+
+# --- Real telephony (Twilio) ---
+
+async def _run_call_twilio_bg(websocket: WebSocket, stream_sid: str, call_sid: str, extension: str = ""):
+    def on_runner_ready(runner):
+        state["runner"] = runner
+        state["status"] = "in_progress"
+
+    try:
+        await run_call_twilio(
+            websocket, stream_sid, call_sid, on_runner_ready=on_runner_ready, known_extension=extension
+        )
+    except Exception as exc:  # noqa: BLE001 -- surface any failure to the UI
+        state["error"] = str(exc)
+        state["status"] = "error"
+    else:
+        state["status"] = "ended"
+    finally:
+        state["runner"] = None
+
+
+@app.post("/api/place-call")
+async def place_call(req: StartCallRequest):
+    if not req.destination_number:
+        return JSONResponse({"error": "destination_number is required"}, status_code=400)
+    if state["status"] in ("starting", "in_progress"):
+        return JSONResponse({"error": "A call is already in progress."}, status_code=409)
+
+    base_url = os.getenv("PUBLIC_BASE_URL")
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
+    if not all([base_url, account_sid, auth_token, from_number]):
+        return JSONResponse(
+            {"error": "Set PUBLIC_BASE_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, "
+                      "TWILIO_PHONE_NUMBER in .env first."},
+            status_code=400,
+        )
+
+    clear_results()
+    state.update(
+        status="starting",
+        runner=None,
+        error=None,
+        destination_number=req.destination_number,
+        extension=req.extension,
+    )
+
+    client = TwilioClient(account_sid, auth_token)
+    try:
+        call = client.calls.create(
+            to=req.destination_number,
+            from_=from_number,
+            url=f"{base_url}/twiml",
+        )
+    except Exception as exc:  # noqa: BLE001 -- surface Twilio API errors to the UI
+        state.update(status="error", error=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return {"status": "calling", "call_sid": call.sid}
+
+
+@app.post("/twiml")
+async def twiml():
+    base_url = os.getenv("PUBLIC_BASE_URL", "")
+    wss_url = base_url.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response><Connect>"
+        f'<Stream url="{wss_url}" />'
+        "</Connect></Response>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.websocket("/ws")
+async def twilio_media_stream(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        # Twilio sends two handshake messages before real audio starts:
+        # "connected" (ignore), then "start" (carries streamSid/callSid).
+        messages = websocket.iter_text()
+        await messages.__anext__()
+        start_data = json.loads(await messages.__anext__())
+        stream_sid = start_data["start"]["streamSid"]
+        call_sid = start_data["start"]["callSid"]
+    except (WebSocketDisconnect, StopAsyncIteration, KeyError):
+        return
+
+    await _run_call_twilio_bg(websocket, stream_sid, call_sid, extension=state["extension"])
 
 
 @app.get("/api/results")
@@ -137,6 +231,9 @@ HTML_PAGE = """<!doctype html>
   #startBtn { background: var(--accent); color: white; }
   #startBtn:hover { background: var(--accent-dark); }
   #startBtn:disabled { background: #b7c6f2; cursor: not-allowed; }
+  #callBtn { background: var(--green); color: white; }
+  #callBtn:hover { background: #128a43; }
+  #callBtn:disabled { background: #b7e2c6; cursor: not-allowed; }
   #endBtn { background: #fee2e2; color: var(--red); }
   #endBtn:hover { background: #fecaca; }
   #endBtn:disabled { background: #f3f4f6; color: #b8bcc4; cursor: not-allowed; }
@@ -180,7 +277,9 @@ HTML_PAGE = """<!doctype html>
   <div class="card">
     <div class="row">
       <input type="text" id="numberInput" placeholder="Insurance company number (e.g. +1 555 201 3344)">
-      <button id="startBtn" onclick="startCall()">Start Call</button>
+      <input type="text" id="extensionInput" placeholder="Extension (if known)" style="max-width:160px;">
+      <button id="startBtn" onclick="startCall()">Start Call (mic demo)</button>
+      <button id="callBtn" onclick="placeCall()">Place Real Call</button>
       <button id="endBtn" onclick="endCall()" disabled>End Call</button>
       <span class="badge badge-idle" id="statusBadge"><span class="dot"></span><span id="statusText">Idle</span></span>
     </div>
@@ -212,7 +311,9 @@ function setStatus(status) {
   const labels = {idle: 'Idle', starting: 'Connecting...', in_progress: 'Call In Progress', ended: 'Call Ended', error: 'Error'};
   badge.className = 'badge badge-' + status;
   text.textContent = labels[status] || status;
-  document.getElementById('startBtn').disabled = (status === 'starting' || status === 'in_progress');
+  const busy = (status === 'starting' || status === 'in_progress');
+  document.getElementById('startBtn').disabled = busy;
+  document.getElementById('callBtn').disabled = busy;
   document.getElementById('endBtn').disabled = (status !== 'in_progress');
 }
 
@@ -223,6 +324,19 @@ async function startCall() {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({destination_number: number})
   });
+}
+
+async function placeCall() {
+  const number = document.getElementById('numberInput').value;
+  const extension = document.getElementById('extensionInput').value;
+  if (!number) { alert('Enter a destination number first.'); return; }
+  lastFilled = new Set();
+  const res = await fetch('/api/place-call', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({destination_number: number, extension: extension})
+  });
+  const data = await res.json();
+  if (data.error) alert(data.error);
 }
 
 async function endCall() {
