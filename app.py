@@ -29,6 +29,7 @@ state = {
     "destination_number": None,
     "extension": "",
     "error": None,
+    "call_sid": None,
 }
 
 # call_sid -> extension, consumed (popped) the first time /ws sees that call_sid.
@@ -81,6 +82,21 @@ async def start_call(req: StartCallRequest):
 
 @app.post("/api/end-call")
 async def end_call():
+    # Ending our own pipeline (runner.end()) does NOT reliably hang up the
+    # real Twilio call -- Pipecat's own auto-hangup only fires if an EndFrame/
+    # CancelFrame happens to reach the serializer before shutdown, which isn't
+    # guaranteed. Observed in practice: frontend showed "ended" while the
+    # receiver's phone was still connected. Hang up explicitly via the REST
+    # API so this is guaranteed regardless of pipeline shutdown timing.
+    call_sid = state.get("call_sid")
+    if call_sid:
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        try:
+            client = TwilioClient(account_sid, auth_token)
+            client.calls(call_sid).update(status="completed")
+        except Exception as exc:  # noqa: BLE001 -- don't block ending our own side on this
+            print(f"[end-call] failed to hang up Twilio call {call_sid}: {exc}")
     if state["runner"] is not None:
         await state["runner"].end()
     return {"status": "ending"}
@@ -89,6 +105,8 @@ async def end_call():
 # --- Real telephony (Twilio) ---
 
 async def _run_call_twilio_bg(websocket: WebSocket, stream_sid: str, call_sid: str, extension: str = ""):
+    state["call_sid"] = call_sid
+
     def on_runner_ready(runner):
         state["runner"] = runner
         state["status"] = "in_progress"
@@ -104,6 +122,7 @@ async def _run_call_twilio_bg(websocket: WebSocket, stream_sid: str, call_sid: s
         state["status"] = "ended"
     finally:
         state["runner"] = None
+        state["call_sid"] = None
 
 
 @app.post("/api/place-call")

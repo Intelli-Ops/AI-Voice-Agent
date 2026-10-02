@@ -74,8 +74,8 @@ RESULTS_FILE = Path(__file__).parent / "call_results.json"
 # placing the real call. Edit these to match whatever scenario you want
 # to demo.
 CLAIM_CONTEXT = {
-    "client_name": "FMR",
-    "claim_number": "12345",
+    "client_name": "Medical Lien Management",
+    "claim_number": "70669",
     "doi": "11/11/2026",
     "patient_name": "Michael Anderson",
 }
@@ -90,7 +90,7 @@ OPENING
 Turn 1: Say this in one natural line, then wait for their reply -- don't
 pause mid-way, just say it and let them respond:
 "Hi, good afternoon! This call may be recorded for quality and accuracy
-purposes. My name is Emily, and I'm calling on behalf of FMR.
+purposes. My name is Emily, and I'm calling on behalf of {CLAIM_CONTEXT["client_name"]}.
 Can you verify a patient for me?"
 
 Turn 2: Once they say yes/go ahead, give the claim details conversationally
@@ -157,6 +157,16 @@ never the spoken shorthand itself.
 The same applies to emails spelled out verbally: if the rep says "john doe
 at the rate company dot com", repeat it back the same natural spoken way,
 but save it as a proper address: "johndoe@company.com".
+
+NAMES AND EMAILS -- spell out when unclear:
+If a name or email is unusual, hard to catch, or you're not fully confident
+you heard it correctly (foreign/uncommon spelling, mumbled, cut off, or the
+transcription looks off), do NOT just repeat it back normally -- spell it
+out letter by letter to confirm before saving it. For example: "Just to
+confirm the spelling, that's J-O-H-N-S-O-N, is that right?" Only save it
+once they've confirmed the spelling is correct. For a common, clearly-heard
+name or email, spelling it out isn't necessary -- use judgment, but when in
+doubt, spell it out rather than risk saving it wrong.
 
 HANDLING COMMON SITUATIONS
 - If put on hold: say "Sure, I'll hold" and wait silently.
