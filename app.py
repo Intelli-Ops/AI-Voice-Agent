@@ -31,6 +31,12 @@ state = {
     "error": None,
 }
 
+# call_sid -> extension, consumed (popped) the first time /ws sees that call_sid.
+# Needed because dialing a known extension now triggers a TwiML redirect that
+# disconnects and reconnects /ws for the SAME call -- without popping, the
+# second connection would see the extension again and redirect forever.
+call_extensions: dict[str, str] = {}
+
 FIELD_LABELS = {
     "claim_confirmed": "Claim Confirmed",
     "claim_status": "Claim Status",
@@ -137,6 +143,8 @@ async def place_call(req: StartCallRequest):
     except Exception as exc:  # noqa: BLE001 -- surface Twilio API errors to the UI
         state.update(status="error", error=str(exc))
         return JSONResponse({"error": str(exc)}, status_code=400)
+    if req.extension:
+        call_extensions[call.sid] = req.extension
     return {"status": "calling", "call_sid": call.sid}
 
 
@@ -167,7 +175,8 @@ async def twilio_media_stream(websocket: WebSocket):
     except (WebSocketDisconnect, StopAsyncIteration, KeyError):
         return
 
-    await _run_call_twilio_bg(websocket, stream_sid, call_sid, extension=state["extension"])
+    extension = call_extensions.pop(call_sid, "")
+    await _run_call_twilio_bg(websocket, stream_sid, call_sid, extension=extension)
 
 
 @app.get("/api/results")

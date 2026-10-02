@@ -33,11 +33,13 @@ from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.extensions.ivr.ivr_navigator import IVRNavigator, IVRStatus
 from pipecat.frames.frames import (
+    EndFrame,
     LLMMessagesUpdateFrame,
     LLMRunFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
     OutputDTMFUrgentFrame,
+    TTSSpeakFrame,
 )
 from pipecat.utils.types import NOT_GIVEN
 from pipecat.pipeline.pipeline import Pipeline
@@ -62,6 +64,7 @@ from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.workers.runner import WorkerRunner
+from twilio.rest import Client as TwilioClient
 
 load_dotenv()
 
@@ -114,17 +117,46 @@ Date of injury (DOI): {CLAIM_CONTEXT["doi"]}
 Patient / claimant name: {CLAIM_CONTEXT["patient_name"]}
 
 TOOL USE
-Whenever the rep confirms a field, ALWAYS immediately call save_field (or
-save_adjuster_info) with the exact value given -- this must happen every
-single time a field is confirmed, don't wait until the end of the call, and
-don't skip it. Saving the data correctly matters more than anything else in
-this call. Confirming the value back to the rep (e.g. "Got it, XYZ-456789")
+Whenever the rep confirms a field, call save_field (or save_adjuster_info)
+with the exact value given -- don't wait until the end of the call, and
+don't skip it. Confirming the value back to the rep (e.g. "Got it, XYZ-456789")
 already happens naturally as part of the GOAL instructions below -- that's
 enough, don't add any extra narration about writing or noting things down.
 For the adjuster's contact details (field 3: name, phone, email, fax),
 use save_adjuster_info with all the pieces you have together in ONE call --
 don't call it separately for each piece, since the rep will usually give
 these together.
+
+IMPORTANT -- call each field EXACTLY ONCE, not repeatedly:
+Each field (claim_confirmed, claim_status, and the adjuster's info) should
+be saved a single time, the first time it's genuinely confirmed with real
+information. Do NOT call save_field again for a field you've already saved,
+even if the rep says something vague afterward like "yes", "I'm here",
+"hello", or repeats themselves -- those are not new confirmations, they're
+just the rep talking. Only call a tool again for the SAME field if the rep
+explicitly gives a DIFFERENT, corrected value for something you already
+have. If you're not sure whether something was actually just confirmed,
+don't call the tool -- ask a clarifying question in your spoken reply instead.
+
+You may see a system message starting with "Already confirmed, do NOT ask
+for these again" -- that's a live, accurate record of exactly what's already
+been saved, even if the actual exchange where it was given has scrolled out
+of view further up. Trust it completely: never re-ask for anything listed
+there, and never re-save it either, unless the rep is explicitly correcting
+a value you already have.
+
+NUMBERS AND EMAILS -- spoken form vs. saved form:
+When repeating a number back to the rep out loud, mirror the way THEY said
+it -- if they say "double two" or "triple five", say "double two" or
+"triple five" back, not "22" or "555". It sounds natural and confirms you
+heard the same shorthand they used.
+When SAVING that same value via a tool call, always convert it to the actual
+characters it represents -- "triple five" becomes "555", "double two"
+becomes "22". The saved value should always be clean, final digits/text,
+never the spoken shorthand itself.
+The same applies to emails spelled out verbally: if the rep says "john doe
+at the rate company dot com", repeat it back the same natural spoken way,
+but save it as a proper address: "johndoe@company.com".
 
 HANDLING COMMON SITUATIONS
 - If put on hold: say "Sure, I'll hold" and wait silently.
@@ -134,12 +166,26 @@ HANDLING COMMON SITUATIONS
   by patient name instead of claim number.
 - If interrupted mid-sentence: stop talking immediately and listen.
 
-CLOSING
+CLOSING -- this is TWO separate turns, not one:
 Once all fields are collected (or the rep indicates no more info is
 available), do NOT repeat or summarize everything back -- that's already
-confirmed field by field as you went. Just wrap up briefly: thank them for
-their time, ask for their name and a call reference number for your records,
-then say a short, warm goodbye.
+confirmed field by field as you went.
+
+Turn A: Thank them for their time and ask for their name and a call
+reference number for your records. Then STOP -- do not say goodbye yet,
+wait for their actual reply.
+
+Turn B: Only after they've answered (or told you they don't have a
+reference number), say a short, warm goodbye, and in that SAME turn
+immediately call the end_call tool. Never combine turn A and turn B into
+one response -- saying goodbye before they've actually answered confuses
+them and makes you sound broken.
+
+NEVER call end_call anywhere else -- not after your opening line, not after
+a single question, not just because a sentence felt complete. It is ONLY
+for turn B above: after the literal spoken goodbye, at the very end of a
+call where the claim has already been confirmed and there is truly nothing
+left to ask.
 
 TONE
 Professional, direct, courteous. Speak in short, clear sentences -- you're on
@@ -179,6 +225,20 @@ def clear_results():
         RESULTS_FILE.unlink()
 
 
+def _collected_fields_status() -> str:
+    """A deterministic "here's what's already confirmed" line, read straight
+    from call_results.json. Used instead of trusting the LLM's own fuzzy
+    one-sentence summary to remember which fields it already has -- that
+    summary was observed losing adjuster info entirely (it only mentioned
+    claim details) once the sliding window trimmed the actual exchange out,
+    causing the model to re-ask for a name/phone it had already saved."""
+    results = _load_results()
+    if not results:
+        return ""
+    parts = [f"{field} = {entry['value']}" for field, entry in results.items()]
+    return "Already confirmed, do NOT ask for these again: " + "; ".join(parts)
+
+
 def _save(field_name: str, value: str):
     results = _load_results()
     results[field_name] = {"value": value, "captured_at": datetime.now(timezone.utc).isoformat()}
@@ -189,15 +249,28 @@ def _save(field_name: str, value: str):
 async def save_field(params: FunctionCallParams):
     field_name = params.arguments["field_name"]
     value = params.arguments["value"]
+    # Defense in depth against the model re-calling this for a field it already
+    # saved (observed: it repeated save_field for claim_confirmed 4 times in one
+    # call off vague acknowledgments like "yeah"/"hello?"). The prompt now also
+    # tells it not to, but this guard protects the stored data either way.
+    if field_name in _load_results():
+        logger.info(f"save_field: {field_name!r} already recorded, ignoring duplicate call")
+        await params.result_callback({"status": "already_recorded", "field_name": field_name})
+        return
     _save(field_name, value)
     await params.result_callback({"status": "saved", "field_name": field_name})
 
 
 async def save_adjuster_info(params: FunctionCallParams):
+    existing = _load_results()
     for key in ("name", "phone", "email", "fax"):
         value = params.arguments.get(key)
-        if value:
-            _save(f"adjuster_{key}", value)
+        if not value:
+            continue
+        field_name = f"adjuster_{key}"
+        if existing.get(field_name, {}).get("value") == value:
+            continue  # unchanged -- skip the redundant rewrite
+        _save(field_name, value)
     await params.result_callback({"status": "saved"})
 
 
@@ -234,6 +307,59 @@ save_adjuster_info_schema = FunctionSchema(
 )
 
 
+def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
+    """Build the end_call tool, bound to this specific call's call_sid via closure.
+
+    Nothing currently tells the pipeline the call is over after Emily's
+    goodbye -- it just sits open waiting indefinitely (until the idle-timeout
+    eventually fires, 90s+ later). This gives the model an explicit way to
+    end it right after saying goodbye: ends the Pipecat pipeline/websocket,
+    and for a real Twilio call, also hangs up the actual PSTN call via the
+    REST API as a safety net (in case the <Connect><Stream> fallthrough
+    doesn't tear down the call on its own in every configuration).
+    """
+
+    async def end_call(params: FunctionCallParams):
+        # Hard guard: observed the model call this on its very first turn,
+        # right after the opening greeting, before the rep had said anything
+        # -- hanging up the call before any real work happened. The prompt
+        # alone wasn't a strong enough constraint for something this costly,
+        # so refuse outright unless the claim has actually been confirmed.
+        if "claim_confirmed" not in _load_results():
+            logger.warning(
+                "end_call: refused -- called before claim_confirmed was ever saved, "
+                "the call isn't actually done yet"
+            )
+            await params.result_callback(
+                {
+                    "status": "refused",
+                    "reason": "The call is not done -- claim confirmation hasn't happened "
+                    "yet. Continue the conversation, do not end the call.",
+                }
+            )
+            return
+        await params.result_callback({"status": "ending_call"})
+        if call_sid:
+            try:
+                account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+                auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+                client = TwilioClient(account_sid, auth_token)
+                await asyncio.to_thread(lambda: client.calls(call_sid).update(status="completed"))
+            except Exception as exc:  # noqa: BLE001 -- don't block ending our own side on this
+                logger.warning(f"end_call: failed to hang up Twilio call {call_sid}: {exc}")
+        if params.worker_runner:
+            await params.worker_runner.end()
+
+    return FunctionSchema(
+        name="end_call",
+        description="End the phone call. Call this immediately after saying your closing "
+        "goodbye, once there's nothing more to discuss -- the call does not end on its own.",
+        properties={},
+        required=[],
+        handler=end_call,
+    )
+
+
 class ContextTrimmer(FrameProcessor):
     """Caps context sent to the LLM so per-turn latency stays flat as the call goes on.
 
@@ -266,14 +392,35 @@ class ContextTrimmer(FrameProcessor):
             return messages
         system_msg, rest = messages[0], messages[1:]
 
-        summary_msg = (
-            [{"role": "system", "content": f"Summary of the call so far: {self._summary}"}]
-            if self._summary
-            else []
-        )
+        # _trim runs on every frame, many times per turn, and each run's
+        # output feeds back in as the next run's input -- so any status line
+        # we injected last time is still sitting in `rest`. Strip it before
+        # adding a fresh one, or it duplicates endlessly (observed: 9+ copies
+        # of the same "Already confirmed" line stacked up within one call).
+        rest = [
+            m
+            for m in rest
+            if not (
+                m.get("role") == "system"
+                and isinstance(m.get("content"), str)
+                and (
+                    m["content"].startswith("Already confirmed")
+                    or m["content"].startswith("Summary of the call so far")
+                )
+            )
+        ]
+
+        extra_system = []
+        fields_status = _collected_fields_status()
+        if fields_status:
+            extra_system.append({"role": "system", "content": fields_status})
+        if self._summary:
+            extra_system.append(
+                {"role": "system", "content": f"Summary of the call so far: {self._summary}"}
+            )
 
         if len(rest) <= self._max:
-            return [system_msg] + summary_msg + rest
+            return [system_msg] + extra_system + rest
 
         cut = len(rest) - self._max
         while cut < len(rest) and rest[cut].get("role") != "user":
@@ -283,7 +430,7 @@ class ContextTrimmer(FrameProcessor):
         if dropped and not self._summarizing:
             asyncio.create_task(self._summarize(dropped))
 
-        return [system_msg] + summary_msg + kept
+        return [system_msg] + extra_system + kept
 
     async def _summarize(self, dropped_messages: list):
         lines = [
@@ -298,7 +445,9 @@ class ContextTrimmer(FrameProcessor):
         try:
             resp = await self._client.chat.completions.create(
                 model=self._summarizer_model,
-                temperature=0,
+                # gpt-6-luna only supports the default temperature (1) -- passing
+                # 0 made every single summarization call fail silently (caught
+                # below), so this has been a no-op since the model switch.
                 max_completion_tokens=60,
                 messages=[
                     {
@@ -323,32 +472,80 @@ class ContextTrimmer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def _on_conversation_detected(processor, conversation_history: list):
-    """A human picked up -- hand off from IVR-navigation mode back to Emily's script."""
-    logger.info("IVR navigator: live conversation detected, resuming normal script")
-    # Tools were cleared on IVR detection (they don't belong in navigation mode,
-    # and left attached the model would sometimes call save_field with junk
-    # values instead of navigating) -- restore them now that a human is on the line.
-    await processor.push_frame(
-        LLMSetToolsFrame(tools=[save_field_schema, save_adjuster_info_schema]),
-        FrameDirection.UPSTREAM,
-    )
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
-    await processor.push_frame(
-        LLMMessagesUpdateFrame(messages=messages, run_llm=True),
-        FrameDirection.UPSTREAM,
-    )
+def _make_on_conversation_detected(vad_start_strategy, end_call_schema):
+    """Bind vad_start_strategy/end_call_schema into the handler via closure,
+    so it can turn real barge-in back on now that a human (not a looping
+    recording) is on the line -- see the comment on enable_vad_interruptions
+    in _build_pipeline for why it starts disabled."""
+
+    async def _on_conversation_detected(processor, conversation_history: list):
+        """A human picked up -- hand off from IVR-navigation mode back to Emily's script."""
+        logger.info("IVR navigator: live conversation detected, resuming normal script")
+        vad_start_strategy._enable_interruptions = True
+        # Tools were cleared on IVR detection (they don't belong in navigation mode,
+        # and left attached the model would sometimes call save_field with junk
+        # values instead of navigating) -- restore them now that a human is on the line.
+        await processor.push_frame(
+            LLMSetToolsFrame(
+                tools=[save_field_schema, save_adjuster_info_schema, end_call_schema]
+            ),
+            FrameDirection.UPSTREAM,
+        )
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
+        await processor.push_frame(
+            LLMMessagesUpdateFrame(messages=messages, run_llm=True),
+            FrameDirection.UPSTREAM,
+        )
+
+    return _on_conversation_detected
 
 
-def _make_on_ivr_status_changed(known_extension: str = ""):
-    """Bind known_extension into the event handler via closure -- add_event_handler
-    only passes (processor, status), so this is how we thread it through."""
+async def _dial_extension_via_call_redirect(call_sid: str, extension: str):
+    """Send real DTMF using Twilio's own native <Play digits> mechanism.
+
+    Confirmed via Twilio's docs: DTMF over bidirectional Media Streams is
+    inbound-only (caller-pressed digits reach us as events) -- there is no
+    supported way to send outbound DTMF through the stream itself. Playing a
+    synthesized tone as in-band audio just relays it as ordinary voice-band
+    sound; Twilio does not re-encode it into real DTMF signaling for the PSTN
+    leg, so it's never guaranteed to be recognized by the far end's phone
+    system (confirmed in testing: it wasn't, no matter how we tuned timing).
+
+    The supported way is a TwiML redirect: update the call's live TwiML to
+    <Play digits="..."> (Twilio's own infrastructure generates the real DTMF),
+    then <Redirect> back to /twiml to reconnect our AI pipeline. This briefly
+    disconnects our current websocket -- the caller of this function's pipeline
+    run will end when that happens, and a fresh one starts when Twilio
+    reconnects to /ws after the redirect.
+    """
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    base_url = os.getenv("PUBLIC_BASE_URL")
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Play digits="{extension}#"/>'
+        f"<Redirect>{base_url}/twiml</Redirect>"
+        "</Response>"
+    )
+    client = TwilioClient(account_sid, auth_token)
+    await asyncio.to_thread(lambda: client.calls(call_sid).update(twiml=twiml))
+
+
+def _make_on_ivr_status_changed(vad_start_strategy, known_extension: str = "", call_sid: str = ""):
+    """Bind known_extension/call_sid/vad_start_strategy into the event handler
+    via closure -- add_event_handler only passes (processor, status), so this
+    is how we thread extra context through."""
     dialed = False
 
     async def _on_ivr_status_changed(processor, status):
         nonlocal dialed
         logger.info(f"IVR navigator status: {status}")
         if status == IVRStatus.DETECTED:
+            # Disable barge-in again in case this is a submenu reached after an
+            # earlier human/conversation phase re-enabled it -- an automated
+            # prompt looping shouldn't be able to self-interrupt like a person.
+            vad_start_strategy._enable_interruptions = False
             # save_field/save_adjuster_info don't apply during IVR navigation --
             # left attached, the model sometimes calls them with junk values
             # instead of emitting <dtmf>/<ivr> tags. Clear them until a human
@@ -365,20 +562,61 @@ def _make_on_ivr_status_changed(known_extension: str = ""):
             # immediately on connect doesn't register, but pressing ~5s in does --
             # the system isn't listening for DTMF until its prompt audio finishes.
             await asyncio.sleep(5)
-            logger.info(f"Dialing known extension {known_extension!r} now")
-            # Many PBX/IVR systems wait for a "#" to terminate extension entry --
-            # without it they just keep waiting for more digits until timeout,
-            # which looks exactly like "we did not receive an extension".
-            digits_to_dial = known_extension + "#"
-            for i, digit in enumerate(digits_to_dial):
-                if i > 0:
-                    # IVR digit detectors need a gap between tones to register
-                    # each press separately -- without it, repeated digits
-                    # (e.g. "888") can blur into one tone or get dropped.
-                    await asyncio.sleep(0.25)
-                await processor.push_frame(OutputDTMFUrgentFrame(button=KeypadEntry(digit)))
+
+            if call_sid:
+                # Real Twilio call -- use the native redirect mechanism, since
+                # in-band audio tones over the Media Stream aren't reliably
+                # recognized as real DTMF by the far end (see docstring above).
+                logger.info(
+                    f"Redirecting call {call_sid} to play real DTMF for extension "
+                    f"{known_extension!r} via Twilio's native mechanism"
+                )
+                await _dial_extension_via_call_redirect(call_sid, known_extension)
+            else:
+                # Local mic demo -- no real telephony/PSTN leg to worry about,
+                # so the in-band tone is fine for a by-ear sanity check.
+                logger.info(f"Dialing known extension {known_extension!r} now (mic demo, in-band tone)")
+                digits_to_dial = known_extension + "#"
+                for i, digit in enumerate(digits_to_dial):
+                    if i > 0:
+                        await asyncio.sleep(0.25)
+                    await processor.push_frame(OutputDTMFUrgentFrame(button=KeypadEntry(digit)))
 
     return _on_ivr_status_changed
+
+
+IDLE_PROMPT_TIMEOUT = 30.0  # seconds of total silence before Emily checks in
+IDLE_MAX_CHECKINS = 3  # consecutive silent check-ins (90s+ total) before giving up
+
+
+def _make_idle_handlers():
+    """Build the pair of event handlers for user-silence handling.
+
+    Real insurance-rep calls routinely involve long silences the rep
+    themselves asked for -- "let me pull that up," being on hold, searching
+    a system. 15s-then-hangup (the first version of this) was ending real
+    calls out from under genuine in-progress holds. Now: a gentle check-in
+    every 30s of silence, up to 3 in a row (90s+ of total dead air with zero
+    response even to being asked directly) before actually ending the call.
+    Any real reply resets the counter back to zero.
+    """
+    idle_count = 0
+
+    async def on_user_idle(aggregator):
+        nonlocal idle_count
+        idle_count += 1
+        if idle_count < IDLE_MAX_CHECKINS:
+            logger.info(f"No response for {IDLE_PROMPT_TIMEOUT}s -- checking in ({idle_count})")
+            await aggregator.push_frame(TTSSpeakFrame(text="Sorry, are you still there?"))
+        else:
+            logger.info(f"No response after {idle_count} check-ins -- ending the call")
+            await aggregator.push_frame(EndFrame())
+
+    async def on_user_turn_stopped(aggregator, *args):
+        nonlocal idle_count
+        idle_count = 0
+
+    return on_user_idle, on_user_turn_stopped
 
 
 REQUIRED_ENV_VARS = ["DEEPGRAM_API_KEY", "OPENAI_API_KEY", "CARTESIA_API_KEY", "CARTESIA_VOICE_ID"]
@@ -394,7 +632,11 @@ def _check_env():
 
 
 def _build_pipeline(
-    transport, sample_rate: int, known_extension: str = "", enable_vad_interruptions: bool = True
+    transport,
+    sample_rate: int,
+    known_extension: str = "",
+    enable_vad_interruptions: bool = True,
+    call_sid: str = "",
 ):
     """Build the agent's brain: VAD, STT, LLM, TTS, context, and the pipeline
     itself. The transport (local mic or Twilio WebSocket) is the only thing
@@ -425,29 +667,47 @@ def _build_pipeline(
         sample_rate=sample_rate,
     )
 
+    end_call_schema = make_end_call_schema(call_sid)
     context = LLMContext(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "(The call has just connected.)"},
         ],
-        tools=[save_field_schema, save_adjuster_info_schema],
+        tools=[save_field_schema, save_adjuster_info_schema, end_call_schema],
     )
+    # Kept as a named variable (not inline) so IVR/conversation-mode handlers
+    # below can flip _enable_interruptions on it at runtime -- it needs to
+    # start off (an IVR's looping announcement shouldn't be able to interrupt
+    # itself mid-dial) but switch back on the moment a real human is talking,
+    # so normal barge-in still works for the actual conversation.
+    vad_start_strategy = VADUserTurnStartStrategy(enable_interruptions=enable_vad_interruptions)
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
-                start=[VADUserTurnStartStrategy(enable_interruptions=enable_vad_interruptions)],
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.5)],
-            )
+                start=[vad_start_strategy],
+                # 0.5s was cutting people off mid-sentence on a normal breath/pause.
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.0)],
+            ),
+            user_idle_timeout=IDLE_PROMPT_TIMEOUT,
         ),
+    )
+    _on_user_idle, _on_user_turn_stopped_reset_idle = _make_idle_handlers()
+    context_aggregator.user().add_event_handler("on_user_turn_idle", _on_user_idle)
+    context_aggregator.user().add_event_handler(
+        "on_user_turn_stopped", _on_user_turn_stopped_reset_idle
     )
 
     context_trimmer = ContextTrimmer(context, openai_api_key=openai_key, max_history_messages=16)
 
     ivr_navigator = IVRNavigator(llm=llm, ivr_prompt=_build_ivr_goal(known_extension))
-    ivr_navigator.add_event_handler("on_conversation_detected", _on_conversation_detected)
     ivr_navigator.add_event_handler(
-        "on_ivr_status_changed", _make_on_ivr_status_changed(known_extension)
+        "on_conversation_detected",
+        _make_on_conversation_detected(vad_start_strategy, end_call_schema),
+    )
+    ivr_navigator.add_event_handler(
+        "on_ivr_status_changed",
+        _make_on_ivr_status_changed(vad_start_strategy, known_extension, call_sid),
     )
 
     # DEBUG: log the raw LLM text before IVRProcessor strips <dtmf>/<ivr> tags out of
@@ -562,7 +822,11 @@ async def run_call_twilio(
     # calls every couple of seconds. Turn-taking still works via the speech-
     # timeout stop strategy below -- we just don't barge-in-cancel on a replay.
     task = _build_pipeline(
-        transport, sample_rate=8000, known_extension=known_extension, enable_vad_interruptions=False
+        transport,
+        sample_rate=8000,
+        known_extension=known_extension,
+        enable_vad_interruptions=False,
+        call_sid=call_sid,
     )
 
     # Don't force Emily to speak first here -- let the IVR classifier listen
@@ -574,7 +838,7 @@ async def run_call_twilio(
 
 async def main():
     clear_results()
-    await run_call(known_extension="888")  # TEMP: testing the proactive-dial DTMF path via mic
+    await run_call()
 
 
 if __name__ == "__main__":
