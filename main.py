@@ -14,6 +14,7 @@ a real call.
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,17 +71,112 @@ load_dotenv()
 
 RESULTS_FILE = Path(__file__).parent / "call_results.json"
 
-# Stand-in for the claim record you'd normally pull from your DB before
-# placing the real call. Edit these to match whatever scenario you want
-# to demo.
-CLAIM_CONTEXT = {
+# Fallback used only when no claim data is supplied for a call (e.g. the
+# local mic demo run with no claim_context argument). Real calls should pass
+# their own claim_context -- see load_claims_from_excel() / run_call_twilio's
+# claim_context param. Kept as a dict, not hardcoded into the prompt, so a
+# real call never needs a code edit to run a different claim.
+DEFAULT_CLAIM_CONTEXT = {
     "client_name": "Medical Lien Management",
     "claim_number": "70669",
     "doi": "11/11/2026",
     "patient_name": "Michael Anderson",
 }
 
-SYSTEM_PROMPT = f"""ROLE
+REQUIRED_CLAIM_FIELDS = ("client_name", "claim_number", "doi", "patient_name")
+
+# Fixed template for the claims upload sheet. Column headers (row 1) must
+# match these exactly, case-insensitively; order doesn't matter.
+EXCEL_CLAIM_COLUMNS = {
+    "destination_number": "destination_number",
+    "extension": "extension",
+    "client_name": "client_name",
+    "claim_number": "claim_number",
+    "doi": "doi",
+    "patient_name": "patient_name",
+}
+
+
+def load_claims_from_excel(file_path) -> list[dict]:
+    """Parse an uploaded .xlsx of claims into a list of per-call dicts.
+
+    Expected header row (any order): destination_number, extension,
+    client_name, claim_number, doi, patient_name. extension is optional and
+    may be blank; every other column is required for a row to be usable.
+    Rows missing a required field are skipped (not raised) so one bad row
+    doesn't block the rest of the sheet -- their skip reason is returned
+    alongside the usable rows so the caller can surface it.
+
+    Returns a list of dicts, each with: destination_number, extension,
+    claim_context (a dict with the 4 REQUIRED_CLAIM_FIELDS keys), and
+    row_number (1-indexed, matching what the user sees in Excel, for error
+    messages).
+    """
+    from openpyxl import load_workbook
+
+    # read_only keeps the file handle open for lazy streaming -- on Windows
+    # that blocks the caller from deleting the (temp) file right after this
+    # returns, so wrap in try/finally and explicitly close before returning.
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+
+        rows_iter = ws.iter_rows(values_only=True)
+        header = next(rows_iter, None)
+        if not header:
+            raise ValueError("Excel sheet is empty -- no header row found.")
+
+        col_index = {}
+        for i, cell in enumerate(header):
+            if cell is None:
+                continue
+            key = str(cell).strip().lower()
+            if key in EXCEL_CLAIM_COLUMNS:
+                col_index[key] = i
+
+        missing_columns = [c for c in EXCEL_CLAIM_COLUMNS if c != "extension" and c not in col_index]
+        if missing_columns:
+            raise ValueError(
+                f"Excel sheet is missing required column(s): {', '.join(missing_columns)}. "
+                f"Expected headers: {', '.join(EXCEL_CLAIM_COLUMNS)}"
+            )
+
+        claims = []
+        for row_number, row in enumerate(rows_iter, start=2):  # row 1 is the header
+            if row is None or all(c is None for c in row):
+                continue  # skip fully blank rows
+
+            def get(key):
+                idx = col_index.get(key)
+                if idx is None or idx >= len(row) or row[idx] is None:
+                    return ""
+                return str(row[idx]).strip()
+
+            claim_context = {field: get(field) for field in REQUIRED_CLAIM_FIELDS}
+            missing = [f for f in REQUIRED_CLAIM_FIELDS if not claim_context[f]]
+            destination_number = get("destination_number")
+            if not destination_number:
+                missing.append("destination_number")
+            if missing:
+                logger.warning(f"Excel row {row_number}: skipped, missing {', '.join(missing)}")
+                continue
+
+            claims.append(
+                {
+                    "row_number": row_number,
+                    "destination_number": destination_number,
+                    "extension": get("extension"),
+                    "claim_context": claim_context,
+                }
+            )
+
+        return claims
+    finally:
+        wb.close()
+
+
+def _build_system_prompt(claim_context: dict) -> str:
+    return f"""ROLE
 Your name is Emily. You are calling on behalf of a medical lien management
 company to verify claims information with an insurance adjuster's office,
 for lien purposes. You are speaking with a representative or adjuster at
@@ -90,13 +186,13 @@ OPENING
 Turn 1: Say this in one natural line, then wait for their reply -- don't
 pause mid-way, just say it and let them respond:
 "Hi, good afternoon! This call may be recorded for quality and accuracy
-purposes. My name is Emily, and I'm calling on behalf of {CLAIM_CONTEXT["client_name"]}.
+purposes. My name is Emily, and I'm calling on behalf of {claim_context["client_name"]}.
 Can you verify a patient for me?"
 
 Turn 2: Once they say yes/go ahead, give the claim details conversationally
 (not as a rattled-off list) so they can pull up the file: mention the claim
-number {CLAIM_CONTEXT["claim_number"]}, date of injury {CLAIM_CONTEXT["doi"]},
-and patient name {CLAIM_CONTEXT["patient_name"]}.
+number {claim_context["claim_number"]}, date of injury {claim_context["doi"]},
+and patient name {claim_context["patient_name"]}.
 
 Sound like a real person on the phone, not a recorded message -- casual,
 natural phrasing, not a scripted monologue.
@@ -111,10 +207,10 @@ for what's still missing.
   3. Adjuster's full name, direct phone number, email address, and fax number
 
 CLAIM CONTEXT (from our records)
-Client: {CLAIM_CONTEXT["client_name"]}
-Claim number: {CLAIM_CONTEXT["claim_number"]}
-Date of injury (DOI): {CLAIM_CONTEXT["doi"]}
-Patient / claimant name: {CLAIM_CONTEXT["patient_name"]}
+Client: {claim_context["client_name"]}
+Claim number: {claim_context["claim_number"]}
+Date of injury (DOI): {claim_context["doi"]}
+Patient / claimant name: {claim_context["patient_name"]}
 
 TOOL USE
 Whenever the rep confirms a field, call save_field (or save_adjuster_info)
@@ -157,6 +253,15 @@ never the spoken shorthand itself.
 The same applies to emails spelled out verbally: if the rep says "john doe
 at the rate company dot com", repeat it back the same natural spoken way,
 but save it as a proper address: "johndoe@company.com".
+
+PHONE AND FAX NUMBERS -- must be complete:
+A real US phone or fax number has 10 digits (or 11 with the country code).
+If save_adjuster_info comes back with status "partial", that means a number
+you gave it was too short -- the rep only gave you part of it. Tell them
+you only caught part of the number and ask specifically for the rest (e.g.
+"I only caught 555-423 for the phone -- could you give me the remaining
+digits?"). Don't call the tool again with that same incomplete number; wait
+until you have the full thing, then save it once.
 
 NAMES AND EMAILS -- spell out when unclear:
 If a name or email is unusual, hard to catch, or you're not fully confident
@@ -256,6 +361,22 @@ def _save(field_name: str, value: str):
     print(f"\n[SAVED] {field_name} = {value}\n")
 
 
+# Valid values for call_outcome, so the results table can be triaged at a
+# glance instead of just "got fields" vs "got nothing": success (claim info
+# collected and call ended cleanly), ivr_dead_end_needs_callback (stuck
+# navigating an automated system -- a human needs to try this one manually),
+# no_answer / busy / failed (set from Twilio's own call status callback,
+# since those calls never even reach our pipeline to record anything else),
+# error (the pipeline itself crashed).
+def save_call_outcome_if_unset(outcome: str):
+    """Set call_outcome only if nothing's recorded one yet, so a more specific
+    outcome (e.g. "success") set earlier doesn't get clobbered by a later,
+    less specific one (e.g. a status callback firing after the call already
+    completed normally)."""
+    if "call_outcome" not in _load_results():
+        _save("call_outcome", outcome)
+
+
 async def save_field(params: FunctionCallParams):
     field_name = params.arguments["field_name"]
     value = params.arguments["value"]
@@ -271,17 +392,51 @@ async def save_field(params: FunctionCallParams):
     await params.result_callback({"status": "saved", "field_name": field_name})
 
 
+def _phone_digit_issue(value: str) -> str | None:
+    """Count digits in a phone/fax number -- a US number should have 10
+    (local) or 11 (with country code) digits. Returns a description of
+    what's missing if it's short, or None if it looks complete. Done here
+    in code rather than trusted to the model's own counting, since LLMs
+    are unreliable at precisely counting digits in a string (observed:
+    numbers like "555423" and "333" getting saved as if complete)."""
+    digits = re.sub(r"\D", "", value)
+    if len(digits) >= 10:
+        return None
+    missing = 10 - len(digits)
+    return (
+        f"only {len(digits)} digit(s) given ({digits!r}) -- a US number needs "
+        f"10 or 11 digits total, so at least {missing} more are missing"
+    )
+
+
 async def save_adjuster_info(params: FunctionCallParams):
     existing = _load_results()
+    incomplete_notes = []
     for key in ("name", "phone", "email", "fax"):
         value = params.arguments.get(key)
         if not value:
             continue
+        if key in ("phone", "fax"):
+            issue = _phone_digit_issue(value)
+            if issue:
+                incomplete_notes.append(f"{key}: {issue}")
+                continue  # don't save an incomplete number
         field_name = f"adjuster_{key}"
         if existing.get(field_name, {}).get("value") == value:
             continue  # unchanged -- skip the redundant rewrite
         _save(field_name, value)
-    await params.result_callback({"status": "saved"})
+    if incomplete_notes:
+        await params.result_callback(
+            {
+                "status": "partial",
+                "issues": incomplete_notes,
+                "instruction": "One or more numbers are incomplete -- ask the rep for "
+                "the remaining digits before confirming those specific fields. Don't "
+                "call this tool again with the same incomplete value, wait for the full number.",
+            }
+        )
+    else:
+        await params.result_callback({"status": "saved"})
 
 
 save_field_schema = FunctionSchema(
@@ -317,6 +472,19 @@ save_adjuster_info_schema = FunctionSchema(
 )
 
 
+async def hang_up_twilio_call(call_sid: str):
+    """Hang up a real Twilio call directly via the REST API. Shared by
+    end_call and the IVR-stuck escalation -- both need a guaranteed hangup
+    that doesn't depend on Pipecat's internal EndFrame/CancelFrame timing."""
+    try:
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        client = TwilioClient(account_sid, auth_token)
+        await asyncio.to_thread(lambda: client.calls(call_sid).update(status="completed"))
+    except Exception as exc:  # noqa: BLE001 -- don't block ending our own side on this
+        logger.warning(f"Failed to hang up Twilio call {call_sid}: {exc}")
+
+
 def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
     """Build the end_call tool, bound to this specific call's call_sid via closure.
 
@@ -348,15 +516,10 @@ def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
                 }
             )
             return
+        save_call_outcome_if_unset("success")
         await params.result_callback({"status": "ending_call"})
         if call_sid:
-            try:
-                account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-                auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-                client = TwilioClient(account_sid, auth_token)
-                await asyncio.to_thread(lambda: client.calls(call_sid).update(status="completed"))
-            except Exception as exc:  # noqa: BLE001 -- don't block ending our own side on this
-                logger.warning(f"end_call: failed to hang up Twilio call {call_sid}: {exc}")
+            await hang_up_twilio_call(call_sid)
         if params.worker_runner:
             await params.worker_runner.end()
 
@@ -482,11 +645,11 @@ class ContextTrimmer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-def _make_on_conversation_detected(vad_start_strategy, end_call_schema):
-    """Bind vad_start_strategy/end_call_schema into the handler via closure,
-    so it can turn real barge-in back on now that a human (not a looping
-    recording) is on the line -- see the comment on enable_vad_interruptions
-    in _build_pipeline for why it starts disabled."""
+def _make_on_conversation_detected(vad_start_strategy, end_call_schema, system_prompt: str):
+    """Bind vad_start_strategy/end_call_schema/system_prompt into the handler
+    via closure, so it can turn real barge-in back on now that a human (not a
+    looping recording) is on the line -- see the comment on
+    enable_vad_interruptions in _build_pipeline for why it starts disabled."""
 
     async def _on_conversation_detected(processor, conversation_history: list):
         """A human picked up -- hand off from IVR-navigation mode back to Emily's script."""
@@ -501,7 +664,7 @@ def _make_on_conversation_detected(vad_start_strategy, end_call_schema):
             ),
             FrameDirection.UPSTREAM,
         )
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
+        messages = [{"role": "system", "content": system_prompt}] + conversation_history
         await processor.push_frame(
             LLMMessagesUpdateFrame(messages=messages, run_llm=True),
             FrameDirection.UPSTREAM,
@@ -592,6 +755,19 @@ def _make_on_ivr_status_changed(vad_start_strategy, known_extension: str = "", c
                         await asyncio.sleep(0.25)
                     await processor.push_frame(OutputDTMFUrgentFrame(button=KeypadEntry(digit)))
 
+        if status == IVRStatus.STUCK:
+            # Previously this just logged and the call sat there -- the
+            # navigator had given up but nothing told the call to actually
+            # stop. Mark it clearly for a human to retry manually, and end
+            # the call rather than burning more time on a dead end.
+            logger.warning(
+                "IVR navigation stuck -- marking call for manual follow-up and ending it"
+            )
+            save_call_outcome_if_unset("ivr_dead_end_needs_callback")
+            if call_sid:
+                await hang_up_twilio_call(call_sid)
+            await processor.push_frame(EndFrame())
+
     return _on_ivr_status_changed
 
 
@@ -647,6 +823,7 @@ def _build_pipeline(
     known_extension: str = "",
     enable_vad_interruptions: bool = True,
     call_sid: str = "",
+    claim_context: dict | None = None,
 ):
     """Build the agent's brain: VAD, STT, LLM, TTS, context, and the pipeline
     itself. The transport (local mic or Twilio WebSocket) is the only thing
@@ -677,10 +854,11 @@ def _build_pipeline(
         sample_rate=sample_rate,
     )
 
+    system_prompt = _build_system_prompt(claim_context or DEFAULT_CLAIM_CONTEXT)
     end_call_schema = make_end_call_schema(call_sid)
     context = LLMContext(
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": "(The call has just connected.)"},
         ],
         tools=[save_field_schema, save_adjuster_info_schema, end_call_schema],
@@ -713,7 +891,7 @@ def _build_pipeline(
     ivr_navigator = IVRNavigator(llm=llm, ivr_prompt=_build_ivr_goal(known_extension))
     ivr_navigator.add_event_handler(
         "on_conversation_detected",
-        _make_on_conversation_detected(vad_start_strategy, end_call_schema),
+        _make_on_conversation_detected(vad_start_strategy, end_call_schema, system_prompt),
     )
     ivr_navigator.add_event_handler(
         "on_ivr_status_changed",
@@ -774,7 +952,7 @@ async def _run_pipeline(task, on_runner_ready=None, speak_first: bool = True):
     await runner.run()
 
 
-async def run_call(on_runner_ready=None, known_extension: str = ""):
+async def run_call(on_runner_ready=None, known_extension: str = "", claim_context: dict | None = None):
     """Local mic/speaker entry point (no telephony)."""
     _check_env()
 
@@ -786,14 +964,21 @@ async def run_call(on_runner_ready=None, known_extension: str = ""):
             audio_out_sample_rate=24000,
         )
     )
-    task = _build_pipeline(transport, sample_rate=16000, known_extension=known_extension)
+    task = _build_pipeline(
+        transport, sample_rate=16000, known_extension=known_extension, claim_context=claim_context
+    )
 
     print("\n=== Voice agent running. Speak into your mic to play the insurance rep. Ctrl+C to stop. ===\n")
     await _run_pipeline(task, on_runner_ready=on_runner_ready)
 
 
 async def run_call_twilio(
-    websocket, stream_sid: str, call_sid: str, on_runner_ready=None, known_extension: str = ""
+    websocket,
+    stream_sid: str,
+    call_sid: str,
+    on_runner_ready=None,
+    known_extension: str = "",
+    claim_context: dict | None = None,
 ):
     """Real-phone-call entry point, driven by a Twilio Media Streams WebSocket.
 
@@ -804,6 +989,9 @@ async def run_call_twilio(
         known_extension: If the destination's extension is already known (e.g. from
             a spreadsheet column), the IVR navigator dials it immediately instead of
             guessing from the menu.
+        claim_context: Per-call claim data (client_name, claim_number, doi,
+            patient_name) -- e.g. one row from an uploaded Excel sheet. Falls
+            back to DEFAULT_CLAIM_CONTEXT if not given.
     """
     _check_env()
 
@@ -837,6 +1025,7 @@ async def run_call_twilio(
         known_extension=known_extension,
         enable_vad_interruptions=False,
         call_sid=call_sid,
+        claim_context=claim_context,
     )
 
     # Don't force Emily to speak first here -- let the IVR classifier listen
