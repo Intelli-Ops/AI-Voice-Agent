@@ -43,12 +43,21 @@ state = {
     "claim_context": None,  # set per-call; falls back to DEFAULT_CLAIM_CONTEXT when idle
 }
 
-# call_sid -> {"extension": ..., "claim_context": ...}, consumed (popped) the
-# first time /ws sees that call_sid. Needed because dialing a known extension
-# now triggers a TwiML redirect that disconnects and reconnects /ws for the
-# SAME call -- without popping, the second connection would see the same
-# data again and redirect forever.
-call_pending_data: dict[str, dict] = {}
+# call_sid -> extension, consumed (POPPED) the first time /ws sees that
+# call_sid. Needed because dialing a known extension triggers a TwiML
+# redirect that disconnects and reconnects /ws for the SAME call -- without
+# popping, the second connection would see the same extension again and
+# redirect forever.
+call_pending_extension: dict[str, str] = {}
+
+# call_sid -> claim_context, kept (NOT popped) for the lifetime of the call.
+# Bug fixed here: this used to live in the same pop-once dict as the
+# extension above, which meant it got wiped out by the very first /ws
+# reconnect after a DTMF redirect -- any call that dialed an extension would
+# silently fall back to DEFAULT_CLAIM_CONTEXT for the rest of the call,
+# because the reconnect found nothing left to read. Claim data needs to
+# survive every reconnect, not just the first leg.
+call_claim_context: dict[str, dict] = {}
 
 # Claims parsed from the last uploaded Excel sheet (see load_claims_from_excel).
 # In-memory only, by design -- this is a prototype, not a durable store.
@@ -156,6 +165,12 @@ async def _run_call_twilio_bg(
     finally:
         state["runner"] = None
         state["call_sid"] = None
+        # NOT clearing call_claim_context[call_sid] here -- this function also
+        # exits when a DTMF redirect disconnects the websocket mid-call (not
+        # just at the true end), and clearing on every exit would wipe the
+        # claim data out before the reconnect leg gets to read it, bringing
+        # back the exact bug this dict was split out to fix. Left to grow for
+        # the life of the process -- acceptable for a prototype's call volume.
 
 
 @app.post("/api/place-call")
@@ -216,7 +231,8 @@ async def place_call(req: StartCallRequest):
     except Exception as exc:  # noqa: BLE001 -- surface Twilio API errors to the UI
         state.update(status="error", error=str(exc))
         return JSONResponse({"error": str(exc)}, status_code=400)
-    call_pending_data[call.sid] = {"extension": extension, "claim_context": claim_context}
+    call_pending_extension[call.sid] = extension
+    call_claim_context[call.sid] = claim_context
     return {"status": "calling", "call_sid": call.sid}
 
 
@@ -247,13 +263,16 @@ async def twilio_media_stream(websocket: WebSocket):
     except (WebSocketDisconnect, StopAsyncIteration, KeyError):
         return
 
-    pending = call_pending_data.pop(call_sid, {})
+    # extension is pop-once (only dial it on the first leg); claim_context
+    # is a plain get, so it's still there after a DTMF-redirect reconnect.
+    extension = call_pending_extension.pop(call_sid, "")
+    claim_context = call_claim_context.get(call_sid)
     await _run_call_twilio_bg(
         websocket,
         stream_sid,
         call_sid,
-        extension=pending.get("extension", ""),
-        claim_context=pending.get("claim_context"),
+        extension=extension,
+        claim_context=claim_context,
     )
 
 
