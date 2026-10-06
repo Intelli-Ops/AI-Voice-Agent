@@ -1,0 +1,15 @@
+from django.urls import path
+
+from . import views
+
+urlpatterns = [
+    path("", views.index, name="index"),
+    path("api/start-call", views.start_call, name="start-call"),
+    path("api/end-call", views.end_call, name="end-call"),
+    path("api/place-call", views.place_call, name="place-call"),
+    path("twiml", views.twiml, name="twiml"),
+    path("call-status", views.call_status, name="call-status"),
+    path("api/results", views.get_results, name="results"),
+    path("api/upload-claims", views.upload_claims, name="upload-claims"),
+    path("api/claims", views.get_claims, name="claims"),
+]
