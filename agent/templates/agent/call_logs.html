@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Call Logs &mdash; Voice Agent</title>
+<style>
+  :root {
+    --bg: #f4f6fb; --card: #ffffff; --border: #e2e6ef; --text: #1a1f2e;
+    --muted: #6b7280; --accent: #2f6fed; --green: #16a34a; --red: #dc2626; --amber: #d97706;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 32px;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  h1 { font-size: 22px; margin: 0; }
+  a.nav-link { color: var(--accent); text-decoration: none; font-size: 14px; margin-left: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 8px; font-size: 14px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .outcome { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .outcome-success { background: #dcfce7; color: var(--green); }
+  .outcome-error, .outcome-failed { background: #fee2e2; color: var(--red); }
+  .outcome-ivr_dead_end_needs_callback { background: #fef3c7; color: var(--amber); }
+  .outcome-pending { background: #f1f2f6; color: var(--muted); }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Call Logs</h1>
+    <div>
+      <span class="muted">{{ request.user.username }}</span>
+      <a class="nav-link" href="{% url 'index' %}">Dial Page</a>
+      <a class="nav-link" href="{% url 'logout' %}">Log Out</a>
+    </div>
+  </div>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Destination</th>
+          <th>Extension</th>
+          <th>Client / Claim / Patient</th>
+          <th>Outcome</th>
+          <th>Started</th>
+          <th>Ended</th>
+          <th>Placed By</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td>{{ log.destination_number }}</td>
+          <td>{{ log.extension|default:"—" }}</td>
+          <td>{{ log.claim_context.client_name }} / {{ log.claim_context.claim_number }} / {{ log.claim_context.patient_name }}</td>
+          <td><span class="outcome outcome-{{ log.call_outcome|default:'pending' }}">{{ log.call_outcome|default:"in progress" }}</span></td>
+          <td>{{ log.started_at }}</td>
+          <td>{{ log.ended_at|default:"—" }}</td>
+          <td>{{ log.placed_by.username|default:"—" }}</td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="7" class="muted">No calls placed yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>

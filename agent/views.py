@@ -9,8 +9,10 @@ import json
 import os
 import tempfile
 
+from django.contrib.auth.decorators import login_required
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 from twilio.rest import Client as TwilioClient
@@ -25,11 +27,20 @@ from main import (
     save_call_outcome_if_unset,
 )
 
+from .decorators import role_required
+from .models import CallLog
 from .state import FIELD_LABELS, call_claim_context, call_pending_extension, state, uploaded_claims
 
 
+@login_required
 def index(request):
     return render(request, "agent/index.html")
+
+
+@role_required("admin")
+def admin_call_logs(request):
+    logs = CallLog.objects.select_related("placed_by").all()
+    return render(request, "agent/call_logs.html", {"logs": logs})
 
 
 async def _run_call_bg(claim_context=None):
@@ -49,6 +60,7 @@ async def _run_call_bg(claim_context=None):
         state["runner"] = None
 
 
+@login_required
 @csrf_exempt
 @require_POST
 async def start_call(request):
@@ -77,6 +89,7 @@ async def start_call(request):
     return JsonResponse({"status": "starting"})
 
 
+@login_required
 @csrf_exempt
 @require_POST
 async def end_call(request):
@@ -97,6 +110,7 @@ async def end_call(request):
 # needs a raw ASGI websocket scope, not Channels.
 
 
+@login_required
 @csrf_exempt
 @require_POST
 async def place_call(request):
@@ -159,6 +173,16 @@ async def place_call(request):
 
     call_pending_extension[call.sid] = extension
     call_claim_context[call.sid] = claim_context
+
+    user = await request.auser()  # login_required guarantees this is authenticated
+    await CallLog.objects.acreate(
+        call_sid=call.sid,
+        destination_number=destination_number,
+        extension=extension,
+        claim_context=claim_context,
+        placed_by=user,
+    )
+
     return JsonResponse({"status": "calling", "call_sid": call.sid})
 
 
@@ -178,11 +202,13 @@ def twiml(request):
 
 @csrf_exempt
 @require_POST
-def call_status(request):
+async def call_status(request):
     """Twilio's status callback webhook -- fires even for calls that are
     never answered (no-answer/busy/failed), which /ws never sees at all
-    since no Media Stream ever connects for those."""
+    since no Media Stream ever connects for those. Not login-gated --
+    Twilio calls this directly and can't supply a session cookie."""
     form = request.POST
+    call_sid = form.get("CallSid", "")
     twilio_status = form.get("CallStatus", "")
     outcome_map = {
         "no-answer": "no_answer",
@@ -193,9 +219,14 @@ def call_status(request):
     outcome = outcome_map.get(twilio_status)
     if outcome:
         save_call_outcome_if_unset(outcome)
+        if call_sid:
+            await CallLog.objects.filter(call_sid=call_sid, call_outcome="").aupdate(
+                call_outcome=outcome, ended_at=timezone.now()
+            )
     return HttpResponse(status=204)
 
 
+@login_required
 @require_GET
 def get_results(request):
     fields = {}
@@ -219,6 +250,7 @@ def get_results(request):
     )
 
 
+@login_required
 @csrf_exempt
 @require_POST
 def upload_claims(request):
@@ -252,6 +284,7 @@ def upload_claims(request):
     return JsonResponse({"status": "loaded", "count": len(claims), "claims": claims})
 
 
+@login_required
 @require_GET
 def get_claims(request):
     return JsonResponse({"claims": uploaded_claims})

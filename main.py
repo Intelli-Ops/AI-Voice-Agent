@@ -335,6 +335,14 @@ def _load_results() -> dict:
     return {}
 
 
+def load_results() -> dict:
+    """Public snapshot of the current call's captured fields + outcome, keyed
+    by field name to {"value", "captured_at"}. Used by callers (e.g. Django's
+    CallLog syncing in agent/ws_server.py) that need to read this after a
+    call ends, without reaching into the private _load_results()."""
+    return _load_results()
+
+
 def clear_results():
     if RESULTS_FILE.exists():
         RESULTS_FILE.unlink()

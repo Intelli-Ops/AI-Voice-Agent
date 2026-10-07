@@ -69,11 +69,22 @@
   tr.just-filled td.value { color: var(--green); }
 
   .hint { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  a.nav-link { color: var(--accent); text-decoration: none; font-size: 14px; margin-left: 16px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>AI Voice Agent &mdash; Lien Verification Demo</h1>
+  <div class="topbar">
+    <h1>AI Voice Agent &mdash; Lien Verification Demo</h1>
+    <div>
+      <span class="sub" style="margin:0;">{{ request.user.username }}</span>
+      {% if request.user.profile.role == "admin" %}
+        <a class="nav-link" href="{% url 'call-logs' %}">Call Logs</a>
+      {% endif %}
+      <a class="nav-link" href="{% url 'logout' %}">Log Out</a>
+    </div>
+  </div>
   <p class="sub">Local prototype: talks through your mic/speakers, following the same pipeline that will run over real telephony once the calling account is set up.</p>
 
   <div class="card">
