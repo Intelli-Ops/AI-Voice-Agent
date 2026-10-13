@@ -32,6 +32,12 @@ call_claim_context: dict[str, dict] = {}
 # In-memory only, by design -- this is a prototype, not a durable store.
 uploaded_claims: list[dict] = []
 
+# Keeps a strong reference to fire-and-forget asyncio.create_task() calls
+# (e.g. the recording-upload pipeline kicked off from a webhook) so they
+# aren't garbage-collected mid-flight -- a bare create_task() result with
+# nothing holding onto it is only weakly referenced by the event loop.
+background_tasks: set = set()
+
 FIELD_LABELS = {
     "call_outcome": "Call Outcome",
     "claim_confirmed": "Claim Confirmed",

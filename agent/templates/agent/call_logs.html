@@ -35,6 +35,7 @@
   .outcome-ivr_dead_end_needs_callback { background: #fef3c7; color: var(--amber); }
   .outcome-pending { background: #f1f2f6; color: var(--muted); }
   .muted { color: var(--muted); }
+  audio { height: 32px; max-width: 220px; }
 </style>
 </head>
 <body>
@@ -42,6 +43,11 @@
   <div class="topbar">
     <h1>Call Logs</h1>
     <div>
+      {% if drive_connected %}
+        <span class="muted">Drive connected</span>
+      {% else %}
+        <a class="nav-link" href="{% url 'google-drive-authorize' %}">Connect Google Drive</a>
+      {% endif %}
       <span class="muted">{{ request.user.username }}</span>
       <a class="nav-link" href="{% url 'index' %}">Dial Page</a>
       <form class="nav-link-form" method="post" action="{% url 'logout' %}">
@@ -61,6 +67,7 @@
           <th>Started</th>
           <th>Ended</th>
           <th>Placed By</th>
+          <th>Recording</th>
         </tr>
       </thead>
       <tbody>
@@ -73,9 +80,22 @@
           <td>{{ log.started_at }}</td>
           <td>{{ log.ended_at|default:"—" }}</td>
           <td>{{ log.placed_by.username|default:"—" }}</td>
+          <td>
+            {% for recording in log.recordings.all %}
+              {% if recording.status == "uploaded" %}
+                <audio controls preload="none" src="{% url 'stream-recording' recording.id %}"></audio>
+              {% elif recording.status == "pending" %}
+                <span class="muted">processing&hellip;</span>
+              {% else %}
+                <span class="muted">upload failed</span>
+              {% endif %}
+            {% empty %}
+              <span class="muted">&mdash;</span>
+            {% endfor %}
+          </td>
         </tr>
         {% empty %}
-        <tr><td colspan="7" class="muted">No calls placed yet.</td></tr>
+        <tr><td colspan="8" class="muted">No calls placed yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>

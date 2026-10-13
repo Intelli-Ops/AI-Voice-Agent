@@ -1,6 +1,7 @@
 # Environment variables and secrets
 .env
 *.env
+google-service-account.json
 
 # Python virtual environments and caches
 venv/

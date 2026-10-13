@@ -858,7 +858,7 @@ def _build_pipeline(
     tts = CartesiaTTSService(
         api_key=cartesia_key,
         voice_id=cartesia_voice_id,
-        model="sonic-2",
+        model="sonic-3.6",
         sample_rate=sample_rate,
     )
 

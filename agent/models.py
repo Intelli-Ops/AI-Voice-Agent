@@ -57,3 +57,51 @@ class CallLog(models.Model):
 
     def __str__(self):
         return f"{self.destination_number} @ {self.started_at:%Y-%m-%d %H:%M} -> {self.call_outcome or 'in progress'}"
+
+
+class Recording(models.Model):
+    """One row per Twilio call recording. The actual audio lives in Google
+    Drive, not here and not on Twilio long-term -- see
+    agent/services/recordings.py for the download -> upload -> delete
+    pipeline that fills this in after Twilio's recording-status webhook
+    fires. status tracks where a given recording is in that pipeline.
+    """
+
+    STATUS_PENDING = "pending"
+    STATUS_UPLOADED = "uploaded"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_UPLOADED, "Uploaded"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    call_log = models.ForeignKey(CallLog, on_delete=models.CASCADE, related_name="recordings")
+    twilio_recording_sid = models.CharField(max_length=64, unique=True, db_index=True)
+    gdrive_file_id = models.CharField(max_length=128, blank=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Recording {self.twilio_recording_sid} ({self.status})"
+
+
+class GoogleDriveAuth(models.Model):
+    """Singleton row holding the refresh token from the one-time Google
+    OAuth consent flow (see /google-drive/authorize and /callback in
+    agent/views.py). Service accounts can't write to regular Drive
+    storage, so uploads act as this authorized user's own account instead
+    -- the refresh token is what lets agent/services/recordings.py get a
+    fresh access token on every call without repeating the consent screen.
+    """
+
+    refresh_token = models.TextField()
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Google Drive OAuth token (updated {self.updated_at:%Y-%m-%d %H:%M})"

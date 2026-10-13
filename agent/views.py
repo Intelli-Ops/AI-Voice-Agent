@@ -10,7 +10,7 @@ import os
 import tempfile
 
 from django.contrib.auth.decorators import login_required
-from django.http import HttpResponse, JsonResponse
+from django.http import Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -27,9 +27,19 @@ from main import (
     save_call_outcome_if_unset,
 )
 
+from google_auth_oauthlib.flow import Flow
+
 from .decorators import role_required
-from .models import CallLog
-from .state import FIELD_LABELS, call_claim_context, call_pending_extension, state, uploaded_claims
+from .models import CallLog, GoogleDriveAuth, Recording
+from .services.recordings import DRIVE_SCOPES, process_recording, stream_recording_bytes
+from .state import (
+    FIELD_LABELS,
+    background_tasks,
+    call_claim_context,
+    call_pending_extension,
+    state,
+    uploaded_claims,
+)
 
 
 @login_required
@@ -39,8 +49,70 @@ def index(request):
 
 @role_required("admin")
 def admin_call_logs(request):
-    logs = CallLog.objects.select_related("placed_by").all()
-    return render(request, "agent/call_logs.html", {"logs": logs})
+    logs = CallLog.objects.select_related("placed_by").prefetch_related("recordings").all()
+    drive_connected = GoogleDriveAuth.objects.exists()
+    return render(request, "agent/call_logs.html", {"logs": logs, "drive_connected": drive_connected})
+
+
+def _build_oauth_flow(state=None):
+    redirect_uri = os.getenv("GOOGLE_DRIVE_REDIRECT_URI")
+    client_config = {
+        "web": {
+            "client_id": os.getenv("GOOGLE_DRIVE_CLIENT_ID"),
+            "client_secret": os.getenv("GOOGLE_DRIVE_CLIENT_SECRET"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [redirect_uri],
+        }
+    }
+    return Flow.from_client_config(
+        client_config, scopes=DRIVE_SCOPES, redirect_uri=redirect_uri, state=state
+    )
+
+
+@role_required("admin")
+def google_drive_authorize(request):
+    """Kicks off the one-time Google OAuth consent flow. Needed because
+    service accounts can't write to regular Drive storage -- this lets
+    uploads act as a real authorized Google user's own account instead."""
+    flow = _build_oauth_flow()
+    # access_type=offline + prompt=consent guarantees a refresh_token comes
+    # back every time (Google otherwise only issues one on a user's very
+    # first consent, which isn't reliable to depend on for re-authorizing).
+    auth_url, oauth_state = flow.authorization_url(
+        access_type="offline", prompt="consent", include_granted_scopes="true"
+    )
+    request.session["google_oauth_state"] = oauth_state
+    return HttpResponseRedirect(auth_url)
+
+
+@role_required("admin")
+def google_drive_callback(request):
+    """Google redirects here (GOOGLE_DRIVE_REDIRECT_URI) with an
+    authorization code after the admin grants consent. Exchanges it for a
+    refresh token and stores it in the GoogleDriveAuth singleton row.
+
+    Builds the authorization_response URL from the known, fixed
+    GOOGLE_DRIVE_REDIRECT_URI rather than request.build_absolute_uri() --
+    behind ngrok, Django's own scheme detection isn't reliable enough to
+    trust matching exactly what Google expects back.
+    """
+    redirect_uri = os.getenv("GOOGLE_DRIVE_REDIRECT_URI")
+    authorization_response = f"{redirect_uri}?{request.META.get('QUERY_STRING', '')}"
+    flow = _build_oauth_flow(state=request.session.get("google_oauth_state"))
+    flow.fetch_token(authorization_response=authorization_response)
+
+    refresh_token = flow.credentials.refresh_token
+    if not refresh_token:
+        return HttpResponse(
+            "Google didn't return a refresh token. Try again -- if it still doesn't show up, "
+            "revoke this app's access at https://myaccount.google.com/permissions and retry.",
+            status=400,
+        )
+
+    GoogleDriveAuth.objects.all().delete()
+    GoogleDriveAuth.objects.create(refresh_token=refresh_token)
+    return HttpResponseRedirect("/call-logs")
 
 
 async def _run_call_bg(claim_context=None):
@@ -166,6 +238,9 @@ async def place_call(request):
             url=f"{base_url}/twiml",
             status_callback=f"{base_url}/call-status",
             status_callback_event=["completed"],
+            record=True,
+            recording_status_callback=f"{base_url}/recording-status",
+            recording_status_callback_event=["completed"],
         )
     except Exception as exc:  # noqa: BLE001 -- surface Twilio API errors to the UI
         state.update(status="error", error=str(exc))
@@ -224,6 +299,39 @@ async def call_status(request):
                 call_outcome=outcome, ended_at=timezone.now()
             )
     return HttpResponse(status=204)
+
+
+@csrf_exempt
+@require_POST
+async def recording_status(request):
+    """Twilio's recording-status callback webhook -- not login-gated, same
+    reasoning as call_status. Fires once the recording is actually ready to
+    download, separately from the call's own completion."""
+    form = request.POST
+    if form.get("RecordingStatus") != "completed":
+        return HttpResponse(status=204)
+
+    call_sid = form.get("CallSid", "")
+    recording_sid = form.get("RecordingSid", "")
+    duration = form.get("RecordingDuration")
+    duration_seconds = int(duration) if duration and duration.isdigit() else None
+
+    if call_sid and recording_sid:
+        task = asyncio.create_task(process_recording(call_sid, recording_sid, duration_seconds))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+    return HttpResponse(status=204)
+
+
+@role_required("admin")
+async def stream_recording(request, recording_id):
+    recording = await Recording.objects.filter(
+        id=recording_id, status=Recording.STATUS_UPLOADED
+    ).afirst()
+    if recording is None:
+        raise Http404("Recording not found or not yet available.")
+    content = await stream_recording_bytes(recording.gdrive_file_id)
+    return HttpResponse(content, content_type="audio/mpeg")
 
 
 @login_required
