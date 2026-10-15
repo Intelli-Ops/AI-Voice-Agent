@@ -1,16 +1,3 @@
-"""
-Local mic/speaker demo of the insurance-verification voice agent.
-
-No telephony involved -- this talks to you directly through your PC's
-microphone and speakers so the AI pipeline (STT -> LLM -> TTS, with
-barge-in/interruption handling) can be validated before wiring up Telnyx.
-
-Run: python main.py
-Then just talk. Play the role of the insurance rep; the agent will ask
-its questions and read them back for confirmation, same as it would on
-a real call.
-"""
-
 import asyncio
 import json
 import os
@@ -26,7 +13,14 @@ from openai import AsyncOpenAI
 # DEBUG: verbose logging while we troubleshoot IVR/DTMF navigation -- shows
 # the raw LLM text (including <dtmf>/<ivr> tags) so we can see whether the
 # model is actually producing them or returning empty responses.
-logger.remove()
+#
+# Removes only loguru's own default console handler (id 0), not every handler:
+# under Django, settings.py has already added the logs/agent.log file handler
+# by the time this module is imported, and a bare logger.remove() deleted it.
+try:
+    logger.remove(0)
+except ValueError:
+    pass  # already removed (e.g. this module imported twice)
 logger.add(sys.stderr, level="DEBUG")
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -590,9 +584,11 @@ class ContextTrimmer(FrameProcessor):
     Keeps the system prompt, a running summary of everything older, and only
     the most recent messages -- always cutting at a user-turn boundary so a
     tool_call/tool-result pair never gets split. When the window overflows,
-    the dropped messages are summarized in the background (a separate, cheap
-    Groq call that doesn't block the live turn) instead of just being thrown
+    the dropped messages are summarized in the background (a separate OpenAI
+    call that doesn't block the live turn) instead of just being thrown
     away, so the agent keeps some memory of the earlier part of the call.
+    (It used to be a Groq call, hence the groq package still in
+    requirements.txt.)
     """
 
     def __init__(
