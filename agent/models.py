@@ -33,21 +33,66 @@ def _create_profile_for_new_user(sender, instance, created, **kwargs):
         Profile.objects.get_or_create(user=instance)
 
 
+class CallBatch(models.Model):
+    """One "Call All Rows" run over an uploaded claims sheet. Its rows are
+    CallLog objects, created up front (queued) and dialed one after another
+    by agent/services/batches.py.
+    """
+
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_STOPPED = "stopped"  # a user pressed Stop Batch
+    STATUS_INTERRUPTED = "interrupted"  # the server restarted mid-batch
+    STATUS_CHOICES = [
+        (STATUS_RUNNING, "Running"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_STOPPED, "Stopped"),
+        (STATUS_INTERRUPTED, "Interrupted"),
+    ]
+
+    source_filename = models.CharField(max_length=255, blank=True)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_RUNNING)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Batch {self.id} ({self.source_filename or 'no file name'}) -> {self.status}"
+
+
 class CallLog(models.Model):
     """One row per real (Twilio) call placed -- who it went to, when, and
     how it ended, for the admin call-log view. The local mic demo isn't
     logged here since it isn't a real call to anyone.
+
+    A batch creates its rows before dialing them, so a row can exist with
+    no call_sid yet (queued) -- see status_label.
     """
 
-    call_sid = models.CharField(max_length=64, unique=True, db_index=True)
+    OUTCOME_NOT_CALLED = "not_called"  # batch stopped/interrupted before reaching this row
+    # A connected call is judged on what it captured (main.outcome_from_captured):
+    # success, partial (claim confirmed but details missing), or incomplete
+    # (not even the claim confirmed).
+    OUTCOME_PARTIAL = "partial"
+    OUTCOME_INCOMPLETE = "incomplete"
+
+    batch = models.ForeignKey(CallBatch, on_delete=models.SET_NULL, null=True, blank=True, related_name="calls")
+    row_number = models.PositiveIntegerField(null=True, blank=True)  # the sheet's row, for batch calls
+    call_sid = models.CharField(max_length=64, unique=True, null=True, blank=True, db_index=True)
     destination_number = models.CharField(max_length=32)
     extension = models.CharField(max_length=16, blank=True)
     claim_context = models.JSONField(default=dict)
     # Mirrors main.py's save_call_outcome_if_unset values: success,
     # ivr_dead_end_needs_callback, no_answer, busy, failed, canceled, error,
-    # or "" while the call is still in progress.
+    # plus the two OUTCOME_* values above, or "" while the call is queued or
+    # still in progress.
     call_outcome = models.CharField(max_length=32, blank=True)
     fields_captured = models.JSONField(default=dict)
+    error = models.TextField(blank=True)  # why the call couldn't be placed, if it couldn't
+    # Set on creation, then moved to the actual dial time for batch rows.
     started_at = models.DateTimeField(auto_now_add=True)
     ended_at = models.DateTimeField(null=True, blank=True)
     placed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
@@ -55,8 +100,14 @@ class CallLog(models.Model):
     class Meta:
         ordering = ["-started_at"]
 
+    @property
+    def status_label(self):
+        if self.call_outcome:
+            return self.call_outcome
+        return "in progress" if self.call_sid else "queued"
+
     def __str__(self):
-        return f"{self.destination_number} @ {self.started_at:%Y-%m-%d %H:%M} -> {self.call_outcome or 'in progress'}"
+        return f"{self.destination_number} @ {self.started_at:%Y-%m-%d %H:%M} -> {self.status_label}"
 
 
 class Recording(models.Model):

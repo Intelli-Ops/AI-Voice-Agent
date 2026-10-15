@@ -28,7 +28,7 @@ Deepgram (STT) + Cartesia (TTS) + OpenAI (LLM, model `gpt-6-luna`).
 ```
 voiceagent/           Django project config (settings, urls, asgi)
 agent/                Django app -- all the actual views/models/templates
-  models.py            CallLog, Recording, GoogleDriveAuth, Profile (role)
+  models.py            CallBatch, CallLog, Recording, GoogleDriveAuth, Profile (role)
   views.py             Every HTTP endpoint (dial page, APIs, webhooks, admin pages)
   urls.py
   decorators.py         role_required() -- admin/user gate on top of login_required
@@ -39,6 +39,9 @@ agent/                Django app -- all the actual views/models/templates
   ws_server.py           Twilio Media Stream /ws handler -- raw ASGI, NOT Django
                          Channels (see "Key decisions" below for why)
   services/recordings.py The Twilio -> Google Drive recording pipeline
+  services/batches.py    dial_call() (every real call goes through it) and the
+                         batch dialer loop
+  services/exports.py    Call results -> .xlsx for the admin download
   templates/agent/        index.html (dial page), login.html, call_logs.html (admin)
 main.py                The actual Pipecat pipeline: STT/LLM/TTS wiring, IVR
                         navigation, DTMF dialing, prompt construction, tool
@@ -72,16 +75,23 @@ run.py                 Runs the app via uvicorn against the ASGI app (NOT
    upload is confirmed, and plays it back from the admin call-log page
    (never a public Drive link — streamed through an admin-only endpoint).
 
-## Not yet built (explicitly discussed, not started)
+8. **Batch dialer + Excel export** — upload the sheet, every row is listed
+   on the dial page, "Call All Rows" dials them one after another (never
+   in parallel) and saves each row's status and captured fields as it
+   goes. How a row's outcome is decided: see "Outcome is judged on the
+   data captured" under Key decisions. "Stop Batch" lets the current call finish and marks the rest
+   `not_called`. Admins download results as `.xlsx` from `/call-logs`
+   (one batch, or every call). The single-row "Place Real Call" flow is
+   still there. Verified with Twilio faked out; **not yet run against
+   real calls.**
 
-- **Batch auto-dialer.** Currently: upload Excel → rows appear in a
-  dropdown → manually pick one row at a time → click "Place Real Call".
-  The user wants this replaced with: upload Excel → all rows shown on
-  screen → ONE "Start Calling" button that dials every row sequentially,
-  saving each one's status/captured fields as it goes. Discussed in detail
-  (model: `CallBatch` + per-row `CallLog`s, a background loop that waits
-  for each call's outcome before dialing the next one) but no code written
-  yet.
+## Not yet built / not yet verified
+
+- **Recording upload has never succeeded end to end.** Drive is connected
+  (OAuth as `asva.kamal@appedology.com`), but that account had no access
+  to the Shared Drive/folder in `.env` when last checked — the CTO needs
+  to add it as a member (Contributor+), or authorize with their own
+  account at `/google-drive/authorize`.
 - MySQL is wired up, but no code depends on anything MySQL-specific beyond
   standard Django ORM — moving back to another DB would be trivial if ever
   needed.
@@ -131,6 +141,26 @@ run.py                 Runs the app via uvicorn against the ASGI app (NOT
   reconnect, not just the true end of a call — see the comment on
   `_sync_call_log` in `agent/ws_server.py`).
 
+- **A call is only "over" when Twilio says so, not when `/ws` closes.**
+  `/ws` also disconnects mid-call on a DTMF redirect. The batch loop waits
+  for Twilio's final status (the `/call-status` webhook, or a direct
+  status fetch every 20s in case the webhook is lost) *and* for `/ws` to
+  finish syncing results to the database before it clears
+  `call_results.json` and dials the next row. A connected call that ends
+  with no outcome from the pipeline (e.g. the rep hung up) is recorded as
+  `incomplete`.
+- **The batch loop is an asyncio task inside the web process.** A server
+  restart kills it — and `run.py` uses `reload=True`, so *saving any
+  `.py` file while a batch is running stops the batch*. The next page
+  load marks such a batch `interrupted` and its remaining rows
+  `not_called`; it is not resumed.
+- **Outcome is judged on the data captured, not on who hung up.**
+  `main.outcome_from_captured()`: `success` = claim confirmed + claim
+  status + adjuster name + at least one of phone/email/fax; `partial` =
+  claim confirmed but some of that missing; `incomplete` = connected but
+  claim never confirmed. Applied when Emily ends the call (end_call) and
+  when it ends any other way (rep hangs up, silence timeout).
+
 ## Environment variables needed (`.env`, never committed)
 
 ```
@@ -147,9 +177,9 @@ GOOGLE_DRIVE_SHARED_DRIVE_ID, GOOGLE_DRIVE_FOLDER_ID
 
 - **Twilio** — phone number, calling account.
 - **Deepgram, OpenAI, Cartesia** — API keys for STT/LLM/TTS.
-- **MySQL 8** — local server (installed via MySQL Installer GUI, "Server
-  only", Legacy Authentication Method). Database `voiceagent`, app user
-  `voiceagent_app`.
+- **MySQL** — local server, one per machine (the data does not travel
+  with git; a new machine starts empty unless a `mysqldump` is restored).
+  Database `voiceagent`, app user `voiceagent_app`.
 - **Google Cloud project** `voice-agent-recordings` — OAuth client for
   Drive access; CTO manages this.
 - **Google Workspace Shared Drive** — holds the actual recording files;
@@ -160,9 +190,13 @@ GOOGLE_DRIVE_SHARED_DRIVE_ID, GOOGLE_DRIVE_FOLDER_ID
 
 ## Test accounts that exist right now (change these before real use)
 
-- `admin` / `ChangeMe123!` — role `admin`
-- `rep1` / `RepPass123!` — role `user` (created only to test role gating,
-  safe to delete via `/admin/` if not needed)
+Accounts live in each machine's own database, so these differ per machine.
+A new database needs `python manage.py createsuperuser` and then the
+account's role set to `admin` (new accounts default to `user`), e.g. via
+`/admin/` → Users → the user's Profile.
+
+- `admin` — role `admin`
+- `rep1` — role `user` (for testing role gating)
 
 ## How to run it
 

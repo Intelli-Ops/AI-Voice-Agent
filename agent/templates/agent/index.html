@@ -1,156 +1,380 @@
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Voice Agent Demo</title>
+{% extends "agent/base.html" %}
+
+{% block title %}Dialer — AI Voice Agent{% endblock %}
+{% block nav_dial %}active{% endblock %}
+
+{% block head %}
 <style>
-  :root {
-    --bg: #f4f6fb; --card: #ffffff; --border: #e2e6ef; --text: #1a1f2e;
-    --muted: #6b7280; --accent: #2f6fed; --accent-dark: #1f4fc4;
-    --green: #16a34a; --red: #dc2626; --amber: #d97706;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-    background: var(--bg); color: var(--text); padding: 32px;
-  }
-  .wrap { max-width: 880px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
-  .card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 20px 24px; margin-bottom: 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-  }
-  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  input[type=text] {
-    flex: 1; min-width: 220px; padding: 10px 12px; border: 1px solid var(--border);
-    border-radius: 8px; font-size: 14px;
-  }
-  button {
-    padding: 10px 18px; border-radius: 8px; border: none; font-size: 14px;
-    font-weight: 600; cursor: pointer; transition: background 0.15s;
-  }
-  #startBtn { background: var(--accent); color: white; }
-  #startBtn:hover { background: var(--accent-dark); }
-  #startBtn:disabled { background: #b7c6f2; cursor: not-allowed; }
-  #callBtn { background: var(--green); color: white; }
-  #callBtn:hover { background: #128a43; }
-  #callBtn:disabled { background: #b7e2c6; cursor: not-allowed; }
-  #endBtn { background: #fee2e2; color: var(--red); }
-  #endBtn:hover { background: #fecaca; }
-  #endBtn:disabled { background: #f3f4f6; color: #b8bcc4; cursor: not-allowed; }
-  .badge {
-    display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px;
-    border-radius: 999px; font-size: 12px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.03em;
-  }
-  .dot { width: 8px; height: 8px; border-radius: 50%; }
-  .badge-idle { background: #f1f2f6; color: var(--muted); }
-  .badge-idle .dot { background: #9ca3af; }
-  .badge-starting { background: #fef3c7; color: var(--amber); }
-  .badge-starting .dot { background: var(--amber); animation: pulse 1s infinite; }
-  .badge-in_progress { background: #dcfce7; color: var(--green); }
-  .badge-in_progress .dot { background: var(--green); animation: pulse 1s infinite; }
-  .badge-ended { background: #e0e7ff; color: #4338ca; }
-  .badge-ended .dot { background: #4338ca; }
-  .badge-error { background: #fee2e2; color: var(--red); }
-  .badge-error .dot { background: var(--red); }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .grid { display: grid; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr) minmax(260px, 320px); gap: 20px; align-items: start; }
+  .stack { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 
-  .claim-meta { display: flex; gap: 24px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 10px; }
-  .claim-meta b { color: var(--text); }
+  /* Live call panel */
+  .live {
+    background: var(--gradient); color: #fff; border-radius: var(--radius); padding: 26px 24px 22px;
+    position: relative; overflow: hidden; box-shadow: var(--shadow); text-align: center;
+  }
+  .live::before {
+    content: ""; position: absolute; width: 360px; height: 360px; border-radius: 50%;
+    left: -120px; top: -180px; background: rgba(255, 255, 255, 0.07);
+  }
+  .live > * { position: relative; }
+  .live-status {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px;
+    background: rgba(255, 255, 255, 0.18); font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+  }
+  .live-status .dot { width: 8px; height: 8px; border-radius: 50%; background: rgba(255, 255, 255, 0.6); }
+  .live-status.is-live .dot { background: #7ef0a8; animation: pulse 1.1s infinite; }
+  .live-status.is-error .dot { background: #ffb4b4; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .live-avatar {
+    width: 76px; height: 76px; border-radius: 50%; margin: 18px auto 12px; display: grid; place-items: center;
+    background: rgba(255, 255, 255, 0.16); border: 2px solid rgba(255, 255, 255, 0.45);
+  }
+  .live-number { font-size: 22px; font-weight: 700; letter-spacing: 0.01em; }
+  .live-sub { opacity: 0.85; margin-top: 2px; font-size: 13px; }
+  .live-timer { font-variant-numeric: tabular-nums; margin-top: 6px; font-size: 13px; opacity: 0.9; min-height: 19px; }
+  .live-meta { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 16px; }
+  .live-meta span { background: rgba(255, 255, 255, 0.14); border-radius: 8px; padding: 5px 10px; font-size: 12px; }
+  .live-meta b { font-weight: 600; }
+  .live-actions { margin-top: 18px; display: flex; justify-content: center; }
+  #endBtn {
+    width: 48px; height: 48px; border-radius: 14px; border: none; cursor: pointer; display: grid; place-items: center;
+    background: #e5484d; color: #fff; transition: background 0.15s, opacity 0.15s;
+  }
+  #endBtn:hover:not(:disabled) { background: #d13b40; }
+  #endBtn:disabled { background: rgba(255, 255, 255, 0.2); cursor: not-allowed; }
 
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-  th, td { text-align: left; padding: 10px 8px; font-size: 14px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
-  td.value { font-weight: 500; }
-  td.pending { color: #b8bcc4; font-style: italic; }
-  td.captured-at { color: var(--muted); font-size: 12px; }
+  .dial-row { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 12px; margin-bottom: 12px; }
+  .dial-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+  /* Captured fields */
+  .fields td { padding: 11px 4px; }
+  .fields td:first-child { color: var(--muted); width: 42%; text-transform: capitalize; }
+  td.value { font-weight: 600; }
+  td.pending { color: var(--faint); font-style: italic; }
+  td.captured-at { color: var(--faint); font-size: 12px; text-align: right; white-space: nowrap; }
   tr.just-filled td.value { color: var(--green); }
 
-  .hint { font-size: 13px; color: var(--muted); margin-top: 10px; }
-  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
-  a.nav-link { color: var(--accent); text-decoration: none; font-size: 14px; margin-left: 16px; }
-  .nav-link-form { display: inline; margin-left: 16px; }
-  button.nav-link-btn {
-    background: none; border: none; padding: 0; margin: 0; cursor: pointer;
-    color: var(--accent); text-decoration: none; font-size: 14px; font-weight: normal;
+  /* Claims sheet + batch rows */
+  .upload { display: flex; gap: 8px; align-items: center; }
+  .upload input[type=file] { flex: 1; min-width: 0; font-family: inherit; font-size: 12px; color: var(--muted); }
+  .upload input[type=file]::file-selector-button {
+    font-family: inherit; font-size: 12px; font-weight: 600; padding: 7px 12px; margin-right: 10px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text); cursor: pointer;
+  }
+  #batchSection { display: none; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .batch-actions { display: flex; gap: 8px; }
+  .batch-actions .btn { flex: 1; }
+  #batchSummary { font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .row-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 560px; overflow-y: auto; }
+  .row-item { display: flex; gap: 12px; align-items: flex-start; padding: 11px 2px; border-bottom: 1px solid var(--border); }
+  .row-item:last-child { border-bottom: none; }
+  .row-num {
+    flex-shrink: 0; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--primary-soft); color: var(--primary); font-size: 12px; font-weight: 700;
+  }
+  .row-body { flex: 1; min-width: 0; }
+  .row-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-sub, .row-captured { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  .row-captured {
+    margin-top: 3px; color: var(--text); opacity: 0.75;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .row-item .pill { margin-top: 7px; }
+  .row-captured.is-error { color: var(--red); opacity: 1; }
+
+  /* Batch progress */
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 18px; }
+  .stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+  .stat b { display: block; font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .bar-row { margin-bottom: 12px; }
+  .bar-label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+  .bar-label span:first-child { text-transform: capitalize; }
+  .bar-label span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar { height: 8px; background: var(--grey-soft); border-radius: 999px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 999px; background: var(--primary); opacity: 0.75; }
+  .bar i.c-success { background: var(--green); }
+  .bar i.c-warn { background: #d8901a; }
+  .bar i.c-bad { background: var(--red); }
+  .bar i.c-idle { background: var(--faint); }
+
+  @media (max-width: 1280px) {
+    .grid { grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); }
+    .grid > .stack:last-child { grid-column: 1 / -1; }
+  }
+  @media (max-width: 900px) {
+    .grid { display: flex; flex-direction: column; }
+    .grid > .stack { width: 100%; }
+    .grid > .stack:first-child { order: 2; }
+    .grid > .stack:last-child { order: 3; }
+    .dial-row { grid-template-columns: 1fr; }
   }
 </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="topbar">
-    <h1>AI Voice Agent &mdash; Lien Verification Demo</h1>
-    <div>
-      <span class="sub" style="margin:0;">{{ request.user.username }}</span>
-      {% if request.user.profile.role == "admin" %}
-        <a class="nav-link" href="{% url 'call-logs' %}">Call Logs</a>
-      {% endif %}
-      <form class="nav-link-form" method="post" action="{% url 'logout' %}">
-        {% csrf_token %}
-        <button type="submit" class="nav-link-btn">Log Out</button>
-      </form>
-    </div>
-  </div>
-  <p class="sub">Local prototype: talks through your mic/speakers, following the same pipeline that will run over real telephony once the calling account is set up.</p>
+{% endblock %}
 
-  <div class="card">
-    <h2 style="font-size:15px;margin:0 0 10px;">Load Claims from Excel</h2>
-    <div class="row">
-      <input type="file" id="claimsFile" accept=".xlsx">
-      <button id="uploadBtn" onclick="uploadClaims()">Upload</button>
-      <select id="claimSelect" style="flex:1; min-width:260px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; font-size:14px;" onchange="onClaimSelected()">
+{% block content %}
+<div class="grid">
+  <!-- Left: claims sheet and batch rows -->
+  <div class="stack">
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Claims Sheet</h2>
+          <p>Upload an .xlsx to call every row.</p>
+        </div>
+      </div>
+      <div class="upload">
+        <input type="file" id="claimsFile" accept=".xlsx">
+        <button id="uploadBtn" class="btn btn-secondary btn-sm" onclick="uploadClaims()">Upload</button>
+      </div>
+      <div class="hint">Columns: destination_number, extension (optional), client_name, claim_number, doi, patient_name.</div>
+
+      <div id="batchSection">
+        <div class="batch-actions">
+          <button id="batchBtn" class="btn btn-primary" onclick="startBatch()">Call All Rows</button>
+          <button id="batchStopBtn" class="btn btn-danger" onclick="stopBatch()" disabled>Stop Batch</button>
+        </div>
+        <div id="batchSummary"></div>
+        <div class="hint" style="margin-top:0;">Rows are called one at a time, top to bottom. Stop Batch lets the current call finish and skips the rest.</div>
+        <ul class="row-list" id="batchBody"></ul>
+      </div>
+    </section>
+  </div>
+
+  <!-- Center: live call, dialing controls, captured fields -->
+  <div class="stack">
+    <section class="live">
+      <span class="live-status" id="statusBadge"><span class="dot"></span><span id="statusText">Idle</span></span>
+      <div class="live-avatar">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M5 21V7l7-4 7 4v14M9 21v-6h6v6M9 10h.01M15 10h.01"/></svg>
+      </div>
+      <div class="live-number" id="liveNumber">No active call</div>
+      <div class="live-sub">Insurance claims department</div>
+      <div class="live-timer" id="liveTimer"></div>
+      <div class="live-meta">
+        <span>Client <b id="metaClient">&mdash;</b></span>
+        <span>Claim # <b id="metaClaim">&mdash;</b></span>
+        <span>DOI <b id="metaDoi">&mdash;</b></span>
+        <span>Patient <b id="metaPatient">&mdash;</b></span>
+      </div>
+      <div class="live-actions">
+        <button id="endBtn" onclick="endCall()" disabled title="End call">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 13.3a16 16 0 0 0 3.4 2.6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8M23 1 1 23"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Single Call</h2></div>
+      <label class="field" for="claimSelect">Claim</label>
+      <select id="claimSelect" onchange="onClaimSelected()" style="margin-bottom:12px;">
         <option value="">— manual entry —</option>
       </select>
-    </div>
-    <div class="hint">Columns required: destination_number, extension (optional), client_name, claim_number, doi, patient_name.</div>
+      <div class="dial-row">
+        <div>
+          <label class="field" for="numberInput">Insurance company number</label>
+          <input type="text" id="numberInput" placeholder="+1 555 201 3344">
+        </div>
+        <div>
+          <label class="field" for="extensionInput">Extension</label>
+          <input type="text" id="extensionInput" placeholder="If known">
+        </div>
+      </div>
+      <div class="dial-actions">
+        <button id="callBtn" class="btn btn-primary" onclick="placeCall()">Place Real Call</button>
+        <button id="startBtn" class="btn btn-secondary" onclick="startCall()">Mic Demo</button>
+      </div>
+      <div class="hint">Mic Demo talks through this computer's mic and speakers: wear headphones and play the insurance rep.</div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>Captured Information</h2>
+          <p>Updates live as the agent confirms each field.</p>
+        </div>
+      </div>
+      <table class="fields"><tbody id="resultsBody"></tbody></table>
+    </section>
   </div>
 
-  <div class="card">
-    <div class="row">
-      <input type="text" id="numberInput" placeholder="Insurance company number (e.g. +1 555 201 3344)">
-      <input type="text" id="extensionInput" placeholder="Extension (if known)" style="max-width:160px;">
-      <button id="startBtn" onclick="startCall()">Start Call (mic demo)</button>
-      <button id="callBtn" onclick="placeCall()">Place Real Call</button>
-      <button id="endBtn" onclick="endCall()" disabled>End Call</button>
-      <span class="badge badge-idle" id="statusBadge"><span class="dot"></span><span id="statusText">Idle</span></span>
-    </div>
-    <div class="claim-meta">
-      <span>Client: <b id="metaClient">&mdash;</b></span>
-      <span>Claim #: <b id="metaClaim">&mdash;</b></span>
-      <span>DOI: <b id="metaDoi">&mdash;</b></span>
-      <span>Patient: <b id="metaPatient">&mdash;</b></span>
-    </div>
-    <div class="hint">Wear headphones. When the agent speaks, play the role of the insurance rep/adjuster.</div>
-  </div>
-
-  <div class="card">
-    <h2 style="font-size:15px;margin:0 0 4px;">Captured Information</h2>
-    <p class="sub" style="margin:0 0 8px;">Updates live as the agent confirms each field on the call.</p>
-    <table>
-      <thead><tr><th>Field</th><th>Value</th><th>Captured At</th></tr></thead>
-      <tbody id="resultsBody"></tbody>
-    </table>
+  <!-- Right: batch progress -->
+  <div class="stack">
+    <section class="card">
+      <div class="card-head"><h2>Batch Progress</h2></div>
+      <div class="stats">
+        <div class="stat"><b id="statRows">0</b><span>Rows</span></div>
+        <div class="stat"><b id="statCalled">0</b><span>Called</span></div>
+        <div class="stat"><b id="statSuccess">0</b><span>Successful</span></div>
+      </div>
+      <h2 style="font-size:13px;margin-bottom:12px;">Call Outcomes</h2>
+      <div id="outcomeBars"><div class="empty">Upload a sheet to see outcomes.</div></div>
+    </section>
   </div>
 </div>
+{% endblock %}
 
+{% block scripts %}
 <script>
 let lastFilled = new Set();
+let liveSince = null;  // when the current call went live, for the timer
+let loadedClaims = [];
 
-function setStatus(status) {
-  const badge = document.getElementById('statusBadge');
-  const text = document.getElementById('statusText');
-  const labels = {idle: 'Idle', starting: 'Connecting...', in_progress: 'Call In Progress', ended: 'Call Ended', error: 'Error'};
-  badge.className = 'badge badge-' + status;
-  text.textContent = labels[status] || status;
-  const busy = (status === 'starting' || status === 'in_progress');
-  document.getElementById('startBtn').disabled = busy;
-  document.getElementById('callBtn').disabled = busy;
-  document.getElementById('endBtn').disabled = (status !== 'in_progress');
+// --- Batch: call every row of the uploaded sheet ---
+let callBusy = false;
+let batchRunning = false;
+let batchStopRequested = false;
+let batchShown = false;  // true once a batch (not just the uploaded rows) is on screen
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  // textContent, not innerHTML: captured values are whatever was said on the call.
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
 }
 
-let loadedClaims = [];
+function setStatus(status, destination) {
+  const badge = document.getElementById('statusBadge');
+  const labels = {idle: 'Idle', starting: 'Connecting…', in_progress: 'Call in progress', ended: 'Call ended', error: 'Error'};
+  document.getElementById('statusText').textContent = labels[status] || status;
+  badge.className = 'live-status' + (status === 'in_progress' ? ' is-live' : status === 'error' ? ' is-error' : '');
+  document.getElementById('liveNumber').textContent = destination || 'No active call';
+
+  if (status === 'in_progress') {
+    if (liveSince === null) liveSince = Date.now();
+    const secs = Math.floor((Date.now() - liveSince) / 1000);
+    document.getElementById('liveTimer').textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+  } else {
+    liveSince = null;
+    document.getElementById('liveTimer').textContent = '';
+  }
+
+  callBusy = (status === 'starting' || status === 'in_progress');
+  document.getElementById('startBtn').disabled = callBusy || batchRunning;
+  document.getElementById('callBtn').disabled = callBusy || batchRunning;
+  document.getElementById('endBtn').disabled = (status !== 'in_progress');
+  updateBatchButtons();
+}
+
+function updateBatchButtons() {
+  document.getElementById('batchBtn').disabled = callBusy || batchRunning || !loadedClaims.length;
+  document.getElementById('batchStopBtn').disabled = !batchRunning || batchStopRequested;
+  document.getElementById('uploadBtn').disabled = batchRunning;
+}
+
+function capturedSummary(fields) {
+  return Object.entries(fields || {}).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`).join(' · ');
+}
+
+function statusPill(status) {
+  return el('span', 'pill pill-' + status.replace(/ /g, '_'), status.replace(/_/g, ' '));
+}
+
+// rows: [{row_number, destination_number, extension, claim_context, status, fields_captured, error}]
+function renderBatchRows(rows) {
+  const list = document.getElementById('batchBody');
+  list.innerHTML = '';
+  for (const r of rows) {
+    const cc = r.claim_context || {};
+    const item = el('li', 'row-item');
+    item.appendChild(el('span', 'row-num', r.row_number));
+    const body = el('div', 'row-body');
+    body.appendChild(el('div', 'row-title', `${cc.patient_name} · ${cc.claim_number}`));
+    const number = r.extension ? `${r.destination_number} ext. ${r.extension}` : r.destination_number;
+    body.appendChild(el('div', 'row-sub', `${cc.client_name} · ${number}`));
+    const detail = r.error || capturedSummary(r.fields_captured);
+    if (detail) {
+      const captured = el('div', 'row-captured' + (r.error ? ' is-error' : ''), detail);
+      captured.title = detail;  // full text on hover; the line is clamped to two lines
+      body.appendChild(captured);
+    }
+    // Under the text rather than beside it: "ivr dead end needs callback"
+    // is long enough to squeeze the patient name off a narrow column.
+    body.appendChild(statusPill(r.status));
+    item.appendChild(body);
+    list.appendChild(item);
+  }
+  document.getElementById('batchSection').style.display = rows.length ? 'block' : 'none';
+  renderOutcomes(rows);
+}
+
+const OUTCOME_COLOR = {
+  success: 'c-success', failed: 'c-bad', error: 'c-bad',
+  no_answer: 'c-warn', busy: 'c-warn', canceled: 'c-warn', incomplete: 'c-warn', partial: 'c-warn', ivr_dead_end_needs_callback: 'c-warn',
+  ready: 'c-idle', queued: 'c-idle', not_called: 'c-idle',
+};
+
+function renderOutcomes(rows) {
+  const notCalled = new Set(['ready', 'queued', 'in progress', 'not_called']);
+  document.getElementById('statRows').textContent = rows.length;
+  document.getElementById('statCalled').textContent = rows.filter(r => !notCalled.has(r.status)).length;
+  document.getElementById('statSuccess').textContent = rows.filter(r => r.status === 'success').length;
+
+  const counts = {};
+  rows.forEach(r => { counts[r.status] = (counts[r.status] || 0) + 1; });
+  const box = document.getElementById('outcomeBars');
+  box.innerHTML = '';
+  if (!rows.length) { box.appendChild(el('div', 'empty', 'Upload a sheet to see outcomes.')); return; }
+  Object.entries(counts).sort((a, b) => b[1] - a[1]).forEach(([status, n]) => {
+    const pct = Math.round((n / rows.length) * 100);
+    const row = el('div', 'bar-row');
+    const label = el('div', 'bar-label');
+    label.appendChild(el('span', '', status.replace(/_/g, ' ')));
+    label.appendChild(el('span', '', `${n} · ${pct}%`));
+    const bar = el('div', 'bar');
+    const fill = el('i', OUTCOME_COLOR[status] || '');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    row.appendChild(label);
+    row.appendChild(bar);
+    box.appendChild(row);
+  });
+}
+
+function showUploadedRows() {
+  batchShown = false;
+  renderBatchRows(loadedClaims.map(c => ({...c, status: 'ready', fields_captured: {}, error: ''})));
+  document.getElementById('batchSummary').textContent = `${loadedClaims.length} row(s) ready to call.`;
+  updateBatchButtons();
+}
+
+async function startBatch() {
+  if (!confirm(`Place ${loadedClaims.length} real call(s), one after another?`)) return;
+  lastFilled = new Set();
+  const res = await fetch('/api/batch/start', {method: 'POST'});
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+  pollBatch();
+}
+
+async function stopBatch() {
+  const res = await fetch('/api/batch/stop', {method: 'POST'});
+  const data = await res.json();
+  if (data.error) alert(data.error);
+  pollBatch();
+}
+
+async function pollBatch() {
+  const res = await fetch('/api/batch');
+  const data = await res.json();
+  const batch = data.batch;
+  batchRunning = !!(batch && batch.running);
+  batchStopRequested = !!(batch && batch.stop_requested);
+  if (batch) {
+    batchShown = true;
+    renderBatchRows(batch.rows);
+    let summary = `${batch.done} of ${batch.total} called, ${batch.succeeded} successful.`;
+    if (batch.running) summary = (batch.stop_requested ? 'Stopping after the current call. ' : 'Batch running. ') + summary;
+    else summary = `Batch ${batch.status}. ` + summary;
+    document.getElementById('batchSummary').textContent = summary;
+  } else if (batchShown) {
+    showUploadedRows();
+  }
+  updateBatchButtons();
+}
 
 function selectedClaimIndex() {
   const v = document.getElementById('claimSelect').value;
@@ -167,17 +391,16 @@ async function uploadClaims() {
   if (data.error) { alert(data.error); return; }
   loadedClaims = data.claims;
   populateClaimSelect();
-  alert(`Loaded ${data.count} claim(s).`);
+  showUploadedRows();
 }
 
 function populateClaimSelect() {
   const select = document.getElementById('claimSelect');
   select.innerHTML = '<option value="">— manual entry —</option>';
   loadedClaims.forEach((c, i) => {
-    const opt = document.createElement('option');
-    opt.value = i;
     const cc = c.claim_context;
-    opt.textContent = `Row ${c.row_number}: ${cc.client_name} / ${cc.claim_number} / ${cc.patient_name} -> ${c.destination_number}`;
+    const opt = el('option', '', `Row ${c.row_number}: ${cc.client_name} / ${cc.claim_number} / ${cc.patient_name} → ${c.destination_number}`);
+    opt.value = i;
     select.appendChild(opt);
   });
 }
@@ -194,10 +417,12 @@ async function startCall() {
   const number = document.getElementById('numberInput').value;
   const claimIndex = selectedClaimIndex();
   lastFilled = new Set();
-  await fetch('/api/start-call', {
+  const res = await fetch('/api/start-call', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({destination_number: number, claim_index: claimIndex})
   });
+  const data = await res.json();
+  if (data.error) alert(data.error);
 }
 
 async function placeCall() {
@@ -221,7 +446,7 @@ async function endCall() {
 async function poll() {
   const res = await fetch('/api/results');
   const data = await res.json();
-  setStatus(data.status);
+  setStatus(data.status, data.status === 'idle' ? '' : data.destination_number);
 
   const ctx = data.claim_context || {};
   document.getElementById('metaClient').textContent = ctx.client_name || '—';
@@ -233,13 +458,15 @@ async function poll() {
   body.innerHTML = '';
   for (const key of data.all_field_keys) {
     const f = data.fields[key];
-    const tr = document.createElement('tr');
+    const tr = el('tr');
     if (f && !lastFilled.has(key)) { tr.className = 'just-filled'; lastFilled.add(key); }
-    const label = (f && f.label) || key;
+    tr.appendChild(el('td', '', (f && f.label) || key.replace(/_/g, ' ')));
     if (f) {
-      tr.innerHTML = `<td>${label}</td><td class="value">${f.value}</td><td class="captured-at">${new Date(f.captured_at).toLocaleTimeString()}</td>`;
+      tr.appendChild(el('td', 'value', f.value));
+      tr.appendChild(el('td', 'captured-at', new Date(f.captured_at).toLocaleTimeString()));
     } else {
-      tr.innerHTML = `<td>${label}</td><td class="pending">waiting...</td><td></td>`;
+      tr.appendChild(el('td', 'pending', 'waiting…'));
+      tr.appendChild(el('td', 'captured-at', ''));
     }
     body.appendChild(tr);
   }
@@ -251,12 +478,16 @@ async function loadExistingClaims() {
   if (data.claims && data.claims.length) {
     loadedClaims = data.claims;
     populateClaimSelect();
+    showUploadedRows();
   }
+  // After the uploaded rows are drawn, so a batch already started from them
+  // (e.g. the page was reloaded mid-run) takes over the list.
+  await pollBatch();
+  setInterval(pollBatch, 2000);
 }
 
 setInterval(poll, 1000);
 poll();
 loadExistingClaims();
 </script>
-</body>
-</html>
+{% endblock %}

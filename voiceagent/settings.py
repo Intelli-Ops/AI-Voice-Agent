@@ -116,3 +116,19 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# Everything the agent logs (IVR decisions, tool calls, saved fields,
+# pipeline errors) also goes to logs/agent.log, so a call that went wrong can
+# be looked at afterwards -- the console output is gone once the terminal is
+# closed. Rotated at 10 MB, last 10 files kept; ignored by git (*.log).
+from loguru import logger  # noqa: E402
+
+logger.add(
+    BASE_DIR / "logs" / "agent.log",
+    level="DEBUG",
+    rotation="10 MB",
+    retention=10,
+    enqueue=True,
+    encoding="utf-8",
+)

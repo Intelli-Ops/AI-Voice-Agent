@@ -97,6 +97,18 @@ EXCEL_CLAIM_COLUMNS = {
 }
 
 
+def _excel_cell_text(value) -> str:
+    """A cell's value as the text a person would read in Excel. A date cell
+    comes back from openpyxl as a datetime, whose str() is "1990-10-02
+    00:00:00" -- which Emily then read out loud as the date of injury. A
+    whole number typed into a numeric cell can come back as 888.0."""
+    if isinstance(value, datetime):
+        return value.strftime("%m/%d/%Y")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
 def load_claims_from_excel(file_path) -> list[dict]:
     """Parse an uploaded .xlsx of claims into a list of per-call dicts.
 
@@ -150,7 +162,7 @@ def load_claims_from_excel(file_path) -> list[dict]:
                 idx = col_index.get(key)
                 if idx is None or idx >= len(row) or row[idx] is None:
                     return ""
-                return str(row[idx]).strip()
+                return _excel_cell_text(row[idx])
 
             claim_context = {field: get(field) for field in REQUIRED_CLAIM_FIELDS}
             missing = [f for f in REQUIRED_CLAIM_FIELDS if not claim_context[f]]
@@ -290,11 +302,19 @@ Turn A: Thank them for their time and ask for their name and a call
 reference number for your records. Then STOP -- do not say goodbye yet,
 wait for their actual reply.
 
-Turn B: Only after they've answered (or told you they don't have a
-reference number), say a short, warm goodbye, and in that SAME turn
-immediately call the end_call tool. Never combine turn A and turn B into
-one response -- saying goodbye before they've actually answered confuses
-them and makes you sound broken.
+Turn B: After their reply -- WHATEVER it is -- say a short, warm goodbye,
+and in that SAME turn immediately call the end_call tool. If they gave
+their name or a reference number, save them first with save_field
+(rep_name, reference_number). Never combine turn A and turn B into one
+response -- saying goodbye before they've actually answered confuses them
+and makes you sound broken.
+
+The rep's name and reference number are nice to have, NOT required. Ask
+for them ONCE only. If the rep doesn't have them, won't give them, ignores
+the question, changes the subject, or just says goodbye, do not ask again
+-- go straight to turn B. Likewise, once the claim is confirmed, if the rep
+says goodbye or makes clear they're done, say goodbye and call end_call
+rather than pressing for whatever is still missing.
 
 NEVER call end_call anywhere else -- not after your opening line, not after
 a single question, not just because a sentence felt complete. It is ONLY
@@ -376,6 +396,27 @@ def _save(field_name: str, value: str):
 # no_answer / busy / failed (set from Twilio's own call status callback,
 # since those calls never even reach our pipeline to record anything else),
 # error (the pipeline itself crashed).
+# What a call has to have collected to count as a success, whether or not it
+# ended with Emily's own goodbye: the claim confirmed, its status, the
+# adjuster's name, and at least one way to reach them.
+SUCCESS_REQUIRED_FIELDS = ("claim_confirmed", "claim_status", "adjuster_name")
+ADJUSTER_CONTACT_FIELDS = ("adjuster_phone", "adjuster_email", "adjuster_fax")
+
+
+def outcome_from_captured(fields: dict) -> str:
+    """success / partial / incomplete, judged only on what was captured.
+    fields is {field_name: value}. Used both when Emily ends the call herself
+    and when the call ends some other way (the rep hangs up, the silence
+    timeout fires), so the same data always gets the same outcome."""
+    if all(fields.get(k) for k in SUCCESS_REQUIRED_FIELDS) and any(
+        fields.get(k) for k in ADJUSTER_CONTACT_FIELDS
+    ):
+        return "success"
+    if fields.get("claim_confirmed"):
+        return "partial"
+    return "incomplete"
+
+
 def save_call_outcome_if_unset(outcome: str):
     """Set call_outcome only if nothing's recorded one yet, so a more specific
     outcome (e.g. "success") set earlier doesn't get clobbered by a later,
@@ -453,7 +494,7 @@ save_field_schema = FunctionSchema(
     properties={
         "field_name": {
             "type": "string",
-            "description": "One of: claim_confirmed, claim_status",
+            "description": "One of: claim_confirmed, claim_status, rep_name, reference_number",
         },
         "value": {
             "type": "string",
@@ -524,7 +565,9 @@ def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
                 }
             )
             return
-        save_call_outcome_if_unset("success")
+        save_call_outcome_if_unset(
+            outcome_from_captured({k: v["value"] for k, v in _load_results().items()})
+        )
         await params.result_callback({"status": "ending_call"})
         if call_sid:
             await hang_up_twilio_call(call_sid)

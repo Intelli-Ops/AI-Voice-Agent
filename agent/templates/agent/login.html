@@ -1,50 +1,74 @@
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Log In &mdash; Voice Agent</title>
+{% extends "agent/base.html" %}
+
+{% block title %}Log In — AI Voice Agent{% endblock %}
+
+{% block head %}
 <style>
-  :root {
-    --bg: #f4f6fb; --card: #ffffff; --border: #e2e6ef; --text: #1a1f2e;
-    --muted: #6b7280; --accent: #2f6fed; --accent-dark: #1f4fc4; --red: #dc2626;
+  .login { min-height: 100vh; display: grid; grid-template-columns: 1.1fr 1fr; }
+  .login-art {
+    background: var(--gradient); color: #fff; padding: 48px; display: flex; flex-direction: column;
+    justify-content: space-between; position: relative; overflow: hidden;
   }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-    background: var(--bg); color: var(--text);
-    display: flex; align-items: center; justify-content: center; min-height: 100vh;
+  .login-art::after {
+    content: ""; position: absolute; width: 520px; height: 520px; border-radius: 50%;
+    right: -160px; bottom: -200px; background: rgba(255, 255, 255, 0.08);
   }
-  .card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 32px; width: 100%; max-width: 360px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  .login-art .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 18px; }
+  .login-art .brand .brand-mark { margin: 0; background: rgba(255, 255, 255, 0.18); }
+  .login-art h1 { font-size: 30px; line-height: 1.2; max-width: 420px; }
+  .login-art p { opacity: 0.85; max-width: 420px; margin: 12px 0 0; font-size: 15px; }
+  .login-art .foot { font-size: 12px; opacity: 0.7; position: relative; z-index: 1; }
+  .login-form { display: grid; place-items: center; padding: 32px 16px; background: var(--surface); }
+  .login-form form { width: 100%; max-width: 360px; }
+  .login-form h2 { font-size: 22px; font-weight: 700; }
+  .login-form .sub { color: var(--muted); margin: 6px 0 28px; }
+  .login-form .field-wrap { margin-bottom: 16px; }
+  .login-form .btn { width: 100%; padding: 12px; font-size: 14px; margin-top: 8px; }
+  .errors { color: var(--red); background: var(--red-soft); border-radius: 10px; padding: 10px 12px; font-size: 13px; margin-bottom: 16px; }
+  @media (max-width: 860px) {
+    .login { grid-template-columns: 1fr; }
+    .login-art { padding: 28px 20px; gap: 28px; }
+    .login-art h1 { font-size: 24px; }
   }
-  h1 { font-size: 20px; margin: 0 0 20px; }
-  label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px; }
-  input[type=text], input[type=password] {
-    width: 100%; padding: 10px 12px; border: 1px solid var(--border);
-    border-radius: 8px; font-size: 14px;
-  }
-  button {
-    margin-top: 20px; width: 100%; padding: 10px 18px; border-radius: 8px; border: none;
-    font-size: 14px; font-weight: 600; cursor: pointer; background: var(--accent); color: white;
-  }
-  button:hover { background: var(--accent-dark); }
-  .errors { color: var(--red); font-size: 13px; margin-top: 12px; }
 </style>
-</head>
-<body>
-  <form class="card" method="post">
-    {% csrf_token %}
-    <h1>AI Voice Agent</h1>
-    <label for="id_username">Username</label>
-    <input type="text" name="username" id="id_username" autofocus required>
-    <label for="id_password">Password</label>
-    <input type="password" name="password" id="id_password" required>
-    {% if form.errors %}
-      <div class="errors">Incorrect username or password.</div>
-    {% endif %}
-    <input type="hidden" name="next" value="{{ next }}">
-    <button type="submit">Log In</button>
-  </form>
-</body>
-</html>
+{% endblock %}
+
+{% block body %}
+<div class="login">
+  <section class="login-art">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M8 7v10M4 10v4M16 7v10M20 10v4"/></svg>
+      </div>
+      AI Voice Agent
+    </div>
+    <div style="position:relative;z-index:1;">
+      <h1>Claim verification calls, handled end to end.</h1>
+      <p>Reaches insurance claims departments, navigates their phone menus, and records claim status and adjuster details for every lien.</p>
+    </div>
+    <div class="foot">Internal use only. Calls are recorded.</div>
+  </section>
+  <section class="login-form">
+    <!-- A second submit (double-click) would arrive after the first one has
+         already logged in and rotated the CSRF token, and get a 403. -->
+    <form method="post" onsubmit="this.querySelector('button').disabled = true;">
+      {% csrf_token %}
+      <h2>Welcome back</h2>
+      <p class="sub">Sign in to continue.</p>
+      {% if form.errors %}
+        <div class="errors">Incorrect username or password.</div>
+      {% endif %}
+      <div class="field-wrap">
+        <label class="field" for="id_username">Username</label>
+        <input type="text" name="username" id="id_username" autocomplete="username" autofocus required>
+      </div>
+      <div class="field-wrap">
+        <label class="field" for="id_password">Password</label>
+        <input type="password" name="password" id="id_password" autocomplete="current-password" required>
+      </div>
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="btn btn-primary">Log In</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

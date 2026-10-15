@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}AI Voice Agent{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f6f5fb;
+    --surface: #ffffff;
+    --surface-2: #faf9fe;
+    --border: #e9e6f2;
+    --text: #1d1b2e;
+    --muted: #6e6a85;
+    --faint: #a6a2ba;
+    --primary: #5b4fd6;
+    --primary-dark: #4a3fbf;
+    --primary-soft: #efedfc;
+    --green: #15803d; --green-soft: #dcfce7;
+    --red: #c62828; --red-soft: #fde4e4;
+    --amber: #a15c07; --amber-soft: #fef1d6;
+    --grey-soft: #f0eff5;
+    /* Muted violet-to-rose: the accent, used for the brand mark, the live
+       call panel and the login panel only -- everything else stays neutral. */
+    --gradient: linear-gradient(135deg, #4f46c8 0%, #7c64d8 48%, #b77bbf 100%);
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(29, 27, 46, 0.04), 0 4px 16px rgba(29, 27, 46, 0.04);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3 { margin: 0; letter-spacing: -0.01em; }
+  h1 { font-size: 22px; font-weight: 700; }
+  h2 { font-size: 15px; font-weight: 600; }
+  a { color: var(--primary); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+
+  /* --- App shell: icon rail + top bar --- */
+  .shell { display: flex; min-height: 100vh; }
+  .rail {
+    width: 84px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center; padding: 18px 0; gap: 6px;
+    position: sticky; top: 0; height: 100vh;
+  }
+  .brand-mark {
+    width: 40px; height: 40px; border-radius: 12px; background: var(--gradient);
+    display: grid; place-items: center; color: #fff; margin-bottom: 18px;
+  }
+  .rail a, .rail button {
+    width: 64px; padding: 9px 0 7px; border-radius: 12px; display: flex; flex-direction: column;
+    align-items: center; gap: 4px; color: var(--muted); font-size: 11px; font-weight: 500;
+    text-decoration: none; background: none; border: none; cursor: pointer; font-family: inherit;
+  }
+  .rail a:hover, .rail button:hover { background: var(--surface-2); color: var(--text); }
+  .rail a.active { background: var(--primary-soft); color: var(--primary); }
+  .rail .spacer { flex: 1; }
+  .rail form { margin: 0; }
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    height: 64px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 28px; background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .topbar .product { font-weight: 700; font-size: 16px; }
+  .topbar .product span { color: var(--muted); font-weight: 500; font-size: 13px; margin-left: 10px; }
+  .user-chip { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .avatar {
+    width: 34px; height: 34px; border-radius: 50%; background: var(--gradient); color: #fff;
+    display: grid; place-items: center; font-weight: 600; font-size: 14px; text-transform: uppercase;
+  }
+  .role-tag { font-size: 11px; font-weight: 600; color: var(--primary); background: var(--primary-soft); padding: 2px 8px; border-radius: 999px; }
+  .content { padding: 24px 28px 40px; }
+  .page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .page-head p { margin: 4px 0 0; color: var(--muted); }
+
+  /* --- Building blocks --- */
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 20px; box-shadow: var(--shadow);
+  }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .card-head p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    padding: 9px 16px; border-radius: 10px; border: 1px solid transparent; font-family: inherit;
+    font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; white-space: nowrap;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .btn:hover { text-decoration: none; }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: var(--primary-dark); }
+  .btn-secondary { background: var(--surface); color: var(--text); border-color: var(--border); }
+  .btn-secondary:hover:not(:disabled) { background: var(--surface-2); border-color: #d9d5e8; }
+  .btn-danger { background: var(--red-soft); color: var(--red); }
+  .btn-danger:hover:not(:disabled) { background: #fbd0d0; }
+  .btn-sm { padding: 6px 11px; font-size: 12px; border-radius: 8px; }
+
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+    font-family: inherit; font-size: 14px; color: var(--text); background: var(--surface);
+  }
+  input[type=text]:focus, input[type=password]:focus, select:focus {
+    outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft);
+  }
+  label.field { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 6px; }
+
+  /* Status pills -- one class per call status value. */
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; white-space: nowrap; background: var(--grey-soft); color: var(--muted);
+    text-transform: capitalize;
+  }
+  .pill-success { background: var(--green-soft); color: var(--green); }
+  .pill-in_progress { background: var(--primary-soft); color: var(--primary); }
+  .pill-failed, .pill-error { background: var(--red-soft); color: var(--red); }
+  .pill-no_answer, .pill-busy, .pill-canceled, .pill-incomplete, .pill-partial, .pill-ivr_dead_end_needs_callback { background: var(--amber-soft); color: var(--amber); }
+  .pill-neutral { background: var(--grey-soft); color: var(--muted); }
+  .pill-brand { background: var(--primary-soft); color: var(--primary); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tr:last-child td { border-bottom: none; }
+
+  .empty { text-align: center; color: var(--faint); padding: 28px 12px; }
+
+  @media (max-width: 720px) {
+    .rail { width: 64px; }
+    .rail a, .rail button { width: 52px; font-size: 10px; }
+    .topbar { padding: 0 16px; }
+    .topbar .product span, .user-chip > span:not(.avatar) { display: none; }
+    .content { padding: 16px; }
+  }
+</style>
+{% block head %}{% endblock %}
+</head>
+<body>
+{% block body %}
+<div class="shell">
+  <nav class="rail">
+    <div class="brand-mark" title="AI Voice Agent">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M8 7v10M4 10v4M16 7v10M20 10v4"/></svg>
+    </div>
+    <a href="{% url 'index' %}" class="{% block nav_dial %}{% endblock %}">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z"/></svg>
+      Dialer
+    </a>
+    {% if request.user.profile.role == "admin" %}
+    <a href="{% url 'call-logs' %}" class="{% block nav_logs %}{% endblock %}">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+      Call Logs
+    </a>
+    {% endif %}
+    <div class="spacer"></div>
+    <form method="post" action="{% url 'logout' %}">
+      {% csrf_token %}
+      <button type="submit" title="Log out">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+        Log out
+      </button>
+    </form>
+  </nav>
+  <div class="main">
+    <header class="topbar">
+      <div class="product">AI Voice Agent<span>Claim verification calls</span></div>
+      <div class="user-chip">
+        <span class="avatar">{{ request.user.username|slice:":1" }}</span>
+        <span>{{ request.user.username }}</span>
+        <span class="role-tag">{{ request.user.profile.role }}</span>
+      </div>
+    </header>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}{% endblock %}
+</body>
+</html>

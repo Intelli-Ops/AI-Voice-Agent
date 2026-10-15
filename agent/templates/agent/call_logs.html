@@ -1,105 +1,177 @@
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Call Logs &mdash; Voice Agent</title>
+{% extends "agent/base.html" %}
+{% load agent_extras %}
+
+{% block title %}Call Logs — AI Voice Agent{% endblock %}
+{% block nav_logs %}active{% endblock %}
+
+{% block head %}
 <style>
-  :root {
-    --bg: #f4f6fb; --card: #ffffff; --border: #e2e6ef; --text: #1a1f2e;
-    --muted: #6b7280; --accent: #2f6fed; --green: #16a34a; --red: #dc2626; --amber: #d97706;
+  .head-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .drive-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 999px; }
+  .drive-chip.ok { background: var(--green-soft); color: var(--green); }
+  .drive-chip.ok::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+
+  .batch-table td { font-size: 13px; }
+  .table-wrap { overflow-x: auto; }
+
+  /* Call list, modeled on the dialer's Recent Calls */
+  .calls { list-style: none; margin: 0; padding: 0; }
+  .call { display: flex; gap: 14px; padding: 16px 4px; border-bottom: 1px solid var(--border); }
+  .call:last-child { border-bottom: none; }
+  .call-icon {
+    flex-shrink: 0; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--grey-soft); color: var(--muted); font-weight: 700;
   }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-    background: var(--bg); color: var(--text); padding: 32px;
+  .call-icon.success { background: var(--green-soft); color: var(--green); }
+  .call-icon.warn { background: var(--amber-soft); color: var(--amber); }
+  .call-icon.bad { background: var(--red-soft); color: var(--red); }
+  .call-icon.live { background: var(--primary-soft); color: var(--primary); }
+  .call-main { flex: 1; min-width: 0; }
+  .call-top { display: flex; justify-content: space-between; gap: 12px; }
+  .call-number { font-size: 15px; font-weight: 700; }
+  .call-number small { font-weight: 500; color: var(--muted); font-size: 12px; margin-left: 4px; }
+  .call-when { text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .call-when b { display: block; color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
+  .call-claim { font-size: 13px; color: var(--muted); }
+  .call-claim b { color: var(--text); font-weight: 600; }
+  .captured { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12px; }
+  .captured span { color: var(--muted); text-transform: capitalize; }
+  .captured b { color: var(--text); font-weight: 600; text-transform: none; }
+  .call-error { margin-top: 6px; font-size: 12px; color: var(--red); }
+  .call-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  .call-actions audio { height: 34px; width: 280px; max-width: 100%; }
+  .call-actions .note { font-size: 12px; color: var(--muted); }
+
+  @media (max-width: 720px) {
+    .call-top { flex-direction: column; gap: 4px; }
+    .call-when { text-align: left; }
+    .call-when b { display: inline; margin-right: 6px; }
   }
-  .wrap { max-width: 1100px; margin: 0 auto; }
-  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-  h1 { font-size: 22px; margin: 0; }
-  a.nav-link { color: var(--accent); text-decoration: none; font-size: 14px; margin-left: 16px; }
-  .nav-link-form { display: inline; margin-left: 16px; }
-  button.nav-link-btn {
-    background: none; border: none; padding: 0; margin: 0; cursor: pointer;
-    color: var(--accent); text-decoration: none; font-size: 14px; font-weight: normal;
-  }
-  .card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 20px 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-  }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 8px; font-size: 14px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
-  .outcome { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
-  .outcome-success { background: #dcfce7; color: var(--green); }
-  .outcome-error, .outcome-failed { background: #fee2e2; color: var(--red); }
-  .outcome-ivr_dead_end_needs_callback { background: #fef3c7; color: var(--amber); }
-  .outcome-pending { background: #f1f2f6; color: var(--muted); }
-  .muted { color: var(--muted); }
-  audio { height: 32px; max-width: 220px; }
 </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="topbar">
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
     <h1>Call Logs</h1>
-    <div>
-      {% if drive_connected %}
-        <span class="muted">Drive connected</span>
-      {% else %}
-        <a class="nav-link" href="{% url 'google-drive-authorize' %}">Connect Google Drive</a>
-      {% endif %}
-      <span class="muted">{{ request.user.username }}</span>
-      <a class="nav-link" href="{% url 'index' %}">Dial Page</a>
-      <form class="nav-link-form" method="post" action="{% url 'logout' %}">
-        {% csrf_token %}
-        <button type="submit" class="nav-link-btn">Log Out</button>
-      </form>
-    </div>
+    <p>Every real call placed, with its outcome, captured details and recording. Times are UTC.</p>
   </div>
-  <div class="card">
-    <table>
-      <thead>
-        <tr>
-          <th>Destination</th>
-          <th>Extension</th>
-          <th>Client / Claim / Patient</th>
-          <th>Outcome</th>
-          <th>Started</th>
-          <th>Ended</th>
-          <th>Placed By</th>
-          <th>Recording</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for log in logs %}
-        <tr>
-          <td>{{ log.destination_number }}</td>
-          <td>{{ log.extension|default:"—" }}</td>
-          <td>{{ log.claim_context.client_name }} / {{ log.claim_context.claim_number }} / {{ log.claim_context.patient_name }}</td>
-          <td><span class="outcome outcome-{{ log.call_outcome|default:'pending' }}">{{ log.call_outcome|default:"in progress" }}</span></td>
-          <td>{{ log.started_at }}</td>
-          <td>{{ log.ended_at|default:"—" }}</td>
-          <td>{{ log.placed_by.username|default:"—" }}</td>
-          <td>
-            {% for recording in log.recordings.all %}
-              {% if recording.status == "uploaded" %}
-                <audio controls preload="none" src="{% url 'stream-recording' recording.id %}"></audio>
-              {% elif recording.status == "pending" %}
-                <span class="muted">processing&hellip;</span>
-              {% else %}
-                <span class="muted">upload failed</span>
-              {% endif %}
-            {% empty %}
-              <span class="muted">&mdash;</span>
-            {% endfor %}
-          </td>
-        </tr>
-        {% empty %}
-        <tr><td colspan="8" class="muted">No calls placed yet.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <div class="head-actions">
+    {% if drive_connected %}
+      <span class="drive-chip ok">Google Drive connected</span>
+    {% else %}
+      <a class="btn btn-secondary" href="{% url 'google-drive-authorize' %}">Connect Google Drive</a>
+    {% endif %}
+    <a class="btn btn-primary" href="{% url 'call-logs-export' %}">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+      Download Excel (all calls)
+    </a>
   </div>
 </div>
-</body>
-</html>
+
+<div class="layout">
+  {% if batches %}
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <h2>Batches</h2>
+        <p>Each "Call All Rows" run, with its results as a spreadsheet.</p>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="batch-table">
+        <thead>
+          <tr><th>Batch</th><th>Sheet</th><th>Status</th><th>Successful</th><th>Started</th><th>Started By</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for batch in batches %}
+          <tr>
+            <td><b>#{{ batch.id }}</b></td>
+            <td>{{ batch.source_filename|default:"—" }}</td>
+            <td><span class="pill {% if batch.status == 'completed' %}pill-success{% elif batch.status == 'running' %}pill-in_progress{% else %}pill-busy{% endif %}">{{ batch.status }}</span></td>
+            <td>{{ batch.succeeded }} of {{ batch.total }}</td>
+            <td>{{ batch.created_at|date:"M j, g:i A" }}</td>
+            <td>{{ batch.created_by.username|default:"—" }}</td>
+            <td style="text-align:right;"><a class="btn btn-secondary btn-sm" href="{% url 'call-logs-export' %}?batch={{ batch.id }}">Download Excel</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <div class="card-head"><h2>Recent Calls</h2></div>
+    <ul class="calls">
+      {% for log in logs %}
+      {% with status=log.status_label %}
+      <li class="call">
+        <span class="call-icon {% if status == 'success' %}success{% elif status == 'failed' or status == 'error' %}bad{% elif status == 'in progress' %}live{% elif status == 'queued' or status == 'not_called' %}{% else %}warn{% endif %}">
+          {% if status == 'success' %}&#10003;{% elif status == 'failed' or status == 'error' %}&#10005;{% elif status == 'in progress' %}&bull;{% elif status == 'queued' or status == 'not_called' %}&ndash;{% else %}!{% endif %}
+        </span>
+        <div class="call-main">
+          <div class="call-top">
+            <div>
+              <div class="call-number">{{ log.destination_number }}{% if log.extension %}<small>ext. {{ log.extension }}</small>{% endif %}</div>
+              <div class="chips">
+                <span class="pill pill-{{ status|cut:' ' }}{% if status == 'in progress' %} pill-in_progress{% endif %}">{{ status|humanize_key }}</span>
+                {% if log.batch_id %}<span class="pill pill-brand">Batch #{{ log.batch_id }} · Row {{ log.row_number }}</span>{% endif %}
+              </div>
+            </div>
+            <div class="call-when">
+              <div>{% if log.call_sid %}{{ log.started_at|date:"M j, g:i A" }}{% else %}Not dialed{% endif %}</div>
+              {% with recording=log.recordings.all|first %}{% if recording.duration_seconds %}<b>{{ recording.duration_seconds|mmss }}</b>{% endif %}{% endwith %}
+              {% if log.placed_by %}<div>by {{ log.placed_by.username }}</div>{% endif %}
+            </div>
+          </div>
+          <div class="call-claim">
+            <b>{{ log.claim_context.patient_name|default:"—" }}</b> · Claim {{ log.claim_context.claim_number|default:"—" }} · {{ log.claim_context.client_name|default:"—" }}{% if log.claim_context.doi %} · DOI {{ log.claim_context.doi }}{% endif %}
+          </div>
+          {% if log.fields_captured %}
+          <div class="captured">
+            {% for key, value in log.fields_captured.items %}<span>{{ key|humanize_key }}: <b>{{ value }}</b></span>{% endfor %}
+          </div>
+          {% endif %}
+          {% if log.error %}<div class="call-error">{{ log.error }}</div>{% endif %}
+
+          {% for recording in log.recordings.all %}
+          <div class="call-actions">
+            {% if recording.status == "uploaded" %}
+              <button class="btn btn-secondary btn-sm" type="button" onclick="playRecording(this, '{% url 'stream-recording' recording.id %}')">
+                &#9654; Play recording{% if recording.duration_seconds %} · {{ recording.duration_seconds|mmss }}{% endif %}
+              </button>
+              <a class="btn btn-secondary btn-sm" href="{% url 'stream-recording' recording.id %}?download=1">Download</a>
+            {% elif recording.status == "pending" %}
+              <span class="pill pill-neutral">Recording processing…</span>
+            {% else %}
+              <span class="pill pill-failed" title="{{ recording.error }}">Recording upload failed</span>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </li>
+      {% endwith %}
+      {% empty %}
+      <li class="empty">No calls placed yet.</li>
+      {% endfor %}
+    </ul>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Swap the Play button for a player only when asked: each recording is
+// fetched from Google Drive through the server, so don't load them all up front.
+function playRecording(button, src) {
+  const audio = document.createElement('audio');
+  audio.controls = true;
+  audio.autoplay = true;
+  audio.src = src;
+  button.replaceWith(audio);
+}
+</script>
+{% endblock %}

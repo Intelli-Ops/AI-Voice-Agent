@@ -10,12 +10,12 @@ import os
 import tempfile
 
 from django.contrib.auth.decorators import login_required
+from django.db.models import Count, Q
 from django.http import Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
-from twilio.rest import Client as TwilioClient
 
 from main import (
     DEFAULT_CLAIM_CONTEXT,
@@ -30,13 +30,21 @@ from main import (
 from google_auth_oauthlib.flow import Flow
 
 from .decorators import role_required
-from .models import CallLog, GoogleDriveAuth, Recording
+from .models import CallBatch, CallLog, GoogleDriveAuth, Recording
+from .services.batches import (
+    batch_running,
+    call_in_progress,
+    dial_call,
+    reconcile_orphaned_batches,
+    record_twilio_terminal_status,
+    start_batch,
+)
+from .services.exports import build_call_log_workbook
 from .services.recordings import DRIVE_SCOPES, process_recording, stream_recording_bytes
 from .state import (
     FIELD_LABELS,
     background_tasks,
-    call_claim_context,
-    call_pending_extension,
+    batch_state,
     state,
     uploaded_claims,
 )
@@ -50,8 +58,39 @@ def index(request):
 @role_required("admin")
 def admin_call_logs(request):
     logs = CallLog.objects.select_related("placed_by").prefetch_related("recordings").all()
+    batches = CallBatch.objects.select_related("created_by").annotate(
+        total=Count("calls"),
+        succeeded=Count("calls", filter=Q(calls__call_outcome="success")),
+    )
     drive_connected = GoogleDriveAuth.objects.exists()
-    return render(request, "agent/call_logs.html", {"logs": logs, "drive_connected": drive_connected})
+    return render(
+        request,
+        "agent/call_logs.html",
+        {"logs": logs, "batches": batches, "drive_connected": drive_connected},
+    )
+
+
+@role_required("admin")
+@require_GET
+def export_call_logs(request):
+    """Download call results as .xlsx -- every call, or with ?batch=<id>
+    just that batch in sheet order."""
+    logs = CallLog.objects.select_related("placed_by").prefetch_related("recordings")
+    batch_id = request.GET.get("batch")
+    if batch_id:
+        if not batch_id.isdigit() or not CallBatch.objects.filter(id=batch_id).exists():
+            raise Http404("No such batch.")
+        logs = logs.filter(batch_id=batch_id).order_by("row_number", "id")
+        filename = f"call_results_batch_{batch_id}.xlsx"
+    else:
+        filename = f"call_results_{timezone.now():%Y-%m-%d}.xlsx"
+
+    response = HttpResponse(
+        build_call_log_workbook(logs),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 def _build_oauth_flow(state=None):
@@ -83,6 +122,10 @@ def google_drive_authorize(request):
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
     request.session["google_oauth_state"] = oauth_state
+    # authorization_url() generates a PKCE code_verifier and sends Google its
+    # hash; the callback builds a fresh Flow, so it has to be handed the same
+    # verifier back or the token exchange fails ("Missing code verifier").
+    request.session["google_oauth_code_verifier"] = flow.code_verifier
     return HttpResponseRedirect(auth_url)
 
 
@@ -100,6 +143,7 @@ def google_drive_callback(request):
     redirect_uri = os.getenv("GOOGLE_DRIVE_REDIRECT_URI")
     authorization_response = f"{redirect_uri}?{request.META.get('QUERY_STRING', '')}"
     flow = _build_oauth_flow(state=request.session.get("google_oauth_state"))
+    flow.code_verifier = request.session.get("google_oauth_code_verifier")
     flow.fetch_token(authorization_response=authorization_response)
 
     refresh_token = flow.credentials.refresh_token
@@ -140,7 +184,9 @@ async def start_call(request):
     destination_number = body.get("destination_number", "")
     claim_index = body.get("claim_index")
 
-    if state["status"] in ("starting", "in_progress"):
+    if batch_running():
+        return JsonResponse({"error": "A batch is running."}, status=409)
+    if call_in_progress():
         return JsonResponse({"error": "A call is already in progress."}, status=409)
 
     claim_context = DEFAULT_CLAIM_CONTEXT
@@ -156,6 +202,7 @@ async def start_call(request):
         error=None,
         destination_number=destination_number,
         claim_context=claim_context,
+        dialed_call_sid=None,  # call_results.json now belongs to this demo, not the last real call
     )
     state["task"] = asyncio.create_task(_run_call_bg(claim_context=claim_context))
     return JsonResponse({"status": "starting"})
@@ -204,61 +251,97 @@ async def place_call(request):
 
     if not destination_number:
         return JsonResponse({"error": "destination_number is required"}, status=400)
-    if state["status"] in ("starting", "in_progress"):
+    if batch_running():
+        return JsonResponse({"error": "A batch is running."}, status=409)
+    if call_in_progress():
         return JsonResponse({"error": "A call is already in progress."}, status=409)
 
-    base_url = os.getenv("PUBLIC_BASE_URL")
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_PHONE_NUMBER")
-    if not all([base_url, account_sid, auth_token, from_number]):
-        return JsonResponse(
-            {
-                "error": "Set PUBLIC_BASE_URL, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, "
-                "TWILIO_PHONE_NUMBER in .env first."
-            },
-            status=400,
-        )
-
-    clear_results()
-    state.update(
-        status="starting",
-        runner=None,
-        error=None,
-        destination_number=destination_number,
-        extension=extension,
-        claim_context=claim_context,
-    )
-
-    client = TwilioClient(account_sid, auth_token)
-    try:
-        call = client.calls.create(
-            to=destination_number,
-            from_=from_number,
-            url=f"{base_url}/twiml",
-            status_callback=f"{base_url}/call-status",
-            status_callback_event=["completed"],
-            record=True,
-            recording_status_callback=f"{base_url}/recording-status",
-            recording_status_callback_event=["completed"],
-        )
-    except Exception as exc:  # noqa: BLE001 -- surface Twilio API errors to the UI
-        state.update(status="error", error=str(exc))
-        return JsonResponse({"error": str(exc)}, status=400)
-
-    call_pending_extension[call.sid] = extension
-    call_claim_context[call.sid] = claim_context
-
     user = await request.auser()  # login_required guarantees this is authenticated
-    await CallLog.objects.acreate(
-        call_sid=call.sid,
-        destination_number=destination_number,
-        extension=extension,
-        claim_context=claim_context,
-        placed_by=user,
-    )
+    call_log, error = await dial_call(destination_number, extension, claim_context, user)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+    return JsonResponse({"status": "calling", "call_sid": call_log.call_sid})
 
-    return JsonResponse({"status": "calling", "call_sid": call.sid})
+
+# --- Batch dialing ---
+# The loop itself is agent/services/batches.py; these just start/stop it and
+# report on it.
+
+
+def _batch_payload(batch, rows):
+    finished = [r for r in rows if r.call_outcome]
+    return {
+        "id": batch.id,
+        "status": batch.status,
+        "source_filename": batch.source_filename,
+        "running": batch.status == CallBatch.STATUS_RUNNING,
+        "stop_requested": batch_state["batch_id"] == batch.id and batch_state["stop_requested"],
+        "total": len(rows),
+        "done": len(finished),
+        "succeeded": sum(1 for r in finished if r.call_outcome == "success"),
+        "rows": [
+            {
+                "row_number": r.row_number,
+                "destination_number": r.destination_number,
+                "extension": r.extension,
+                "claim_context": r.claim_context,
+                "status": r.status_label,
+                "fields_captured": r.fields_captured,
+                "error": r.error,
+            }
+            for r in rows
+        ],
+    }
+
+
+@login_required
+@csrf_exempt
+@require_POST
+async def batch_start(request):
+    user = await request.auser()
+    await reconcile_orphaned_batches()
+    if batch_running():
+        return JsonResponse({"error": "A batch is already running."}, status=409)
+    if call_in_progress():
+        return JsonResponse({"error": "A call is already in progress."}, status=409)
+    if not uploaded_claims:
+        return JsonResponse({"error": "Upload a claims sheet first."}, status=400)
+    twilio_env = ("PUBLIC_BASE_URL", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+    if not all(os.getenv(key) for key in twilio_env):
+        # dial_call checks this too, but per row -- catch it once up front
+        # rather than marking every row of the sheet as failed.
+        return JsonResponse({"error": f"Set {', '.join(twilio_env)} in .env first."}, status=400)
+
+    claims = list(uploaded_claims)
+    batch = await start_batch(claims, user, batch_state["upload_filename"])
+    return JsonResponse({"status": "started", "batch_id": batch.id, "count": len(claims)})
+
+
+@login_required
+@csrf_exempt
+@require_POST
+async def batch_stop(request):
+    """Stops dialing further rows. The call in progress, if any, is left to
+    finish -- End Call hangs that one up."""
+    if not batch_running():
+        return JsonResponse({"error": "No batch is running."}, status=409)
+    batch_state["stop_requested"] = True
+    return JsonResponse({"status": "stopping"})
+
+
+@login_required
+@require_GET
+async def batch_status(request):
+    """The batch to show on the dial page: the one running now, otherwise
+    the one started from the sheet that's currently uploaded (so its results
+    stay on screen until a new sheet replaces them)."""
+    await reconcile_orphaned_batches()
+    batch_id = batch_state["batch_id"] or batch_state["upload_batch_id"]
+    batch = await CallBatch.objects.filter(id=batch_id).afirst() if batch_id else None
+    if batch is None:
+        return JsonResponse({"batch": None})
+    rows = [r async for r in CallLog.objects.filter(batch=batch).order_by("row_number", "id")]
+    return JsonResponse({"batch": _batch_payload(batch, rows)})
 
 
 @csrf_exempt
@@ -283,21 +366,7 @@ async def call_status(request):
     since no Media Stream ever connects for those. Not login-gated --
     Twilio calls this directly and can't supply a session cookie."""
     form = request.POST
-    call_sid = form.get("CallSid", "")
-    twilio_status = form.get("CallStatus", "")
-    outcome_map = {
-        "no-answer": "no_answer",
-        "busy": "busy",
-        "failed": "failed",
-        "canceled": "canceled",
-    }
-    outcome = outcome_map.get(twilio_status)
-    if outcome:
-        save_call_outcome_if_unset(outcome)
-        if call_sid:
-            await CallLog.objects.filter(call_sid=call_sid, call_outcome="").aupdate(
-                call_outcome=outcome, ended_at=timezone.now()
-            )
+    await record_twilio_terminal_status(form.get("CallSid", ""), form.get("CallStatus", ""))
     return HttpResponse(status=204)
 
 
@@ -331,7 +400,10 @@ async def stream_recording(request, recording_id):
     if recording is None:
         raise Http404("Recording not found or not yet available.")
     content = await stream_recording_bytes(recording.gdrive_file_id)
-    return HttpResponse(content, content_type="audio/mpeg")
+    response = HttpResponse(content, content_type="audio/mpeg")
+    if request.GET.get("download"):
+        response["Content-Disposition"] = f'attachment; filename="recording_{recording.twilio_recording_sid}.mp3"'
+    return response
 
 
 @login_required
@@ -362,6 +434,13 @@ def get_results(request):
 @csrf_exempt
 @require_POST
 def upload_claims(request):
+    if batch_running():
+        # The running batch has its own copy of the rows, but the page shows
+        # one sheet at a time -- don't swap it out mid-run.
+        return JsonResponse(
+            {"error": "A batch is running -- wait for it to finish or stop it first."}, status=409
+        )
+
     file = request.FILES.get("file")
     if not file or not file.name.lower().endswith(".xlsx"):
         return JsonResponse({"error": "Please upload a .xlsx file."}, status=400)
@@ -389,6 +468,7 @@ def upload_claims(request):
 
     uploaded_claims.clear()
     uploaded_claims.extend(claims)
+    batch_state.update(upload_filename=file.name, upload_batch_id=None)
     return JsonResponse({"status": "loaded", "count": len(claims), "claims": claims})
 
 

@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.models import User
 
-from .models import CallLog, GoogleDriveAuth, Profile, Recording
+from .models import CallBatch, CallLog, GoogleDriveAuth, Profile, Recording
 
 
 class ProfileInline(admin.StackedInline):
@@ -18,9 +18,18 @@ admin.site.unregister(User)
 admin.site.register(User, CustomUserAdmin)
 
 
+@admin.register(CallBatch)
+class CallBatchAdmin(admin.ModelAdmin):
+    list_display = ("id", "source_filename", "status", "created_by", "created_at", "finished_at")
+    list_filter = ("status",)
+    readonly_fields = [f.name for f in CallBatch._meta.fields]
+
+
 @admin.register(CallLog)
 class CallLogAdmin(admin.ModelAdmin):
     list_display = (
+        "batch",
+        "row_number",
         "destination_number",
         "extension",
         "call_outcome",
