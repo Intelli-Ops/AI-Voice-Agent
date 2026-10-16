@@ -57,10 +57,10 @@ def index(request):
 
 @role_required("admin")
 def admin_call_logs(request):
-    logs = CallLog.objects.select_related("placed_by").prefetch_related("recordings").all()
+    logs = CallLog.objects.select_related("placed_by", "batch").prefetch_related("recordings").all()
     batches = CallBatch.objects.select_related("created_by").annotate(
         total=Count("calls"),
-        succeeded=Count("calls", filter=Q(calls__call_outcome="success")),
+        verified=Count("calls", filter=Q(calls__call_outcome=CallLog.OUTCOME_VERIFIED)),
     )
     drive_connected = GoogleDriveAuth.objects.exists()
     return render(
@@ -75,13 +75,14 @@ def admin_call_logs(request):
 def export_call_logs(request):
     """Download call results as .xlsx -- every call, or with ?batch=<id>
     just that batch in sheet order."""
-    logs = CallLog.objects.select_related("placed_by").prefetch_related("recordings")
+    logs = CallLog.objects.select_related("placed_by", "batch").prefetch_related("recordings")
     batch_id = request.GET.get("batch")
     if batch_id:
-        if not batch_id.isdigit() or not CallBatch.objects.filter(id=batch_id).exists():
+        batch = CallBatch.objects.filter(id=batch_id).first() if batch_id.isdigit() else None
+        if batch is None:
             raise Http404("No such batch.")
-        logs = logs.filter(batch_id=batch_id).order_by("row_number", "id")
-        filename = f"call_results_batch_{batch_id}.xlsx"
+        logs = logs.filter(batch=batch).order_by("row_number", "id")
+        filename = f"call_results_batch_{batch.number or batch.id}.xlsx"
     else:
         filename = f"call_results_{timezone.now():%Y-%m-%d}.xlsx"
 
@@ -272,20 +273,24 @@ def _batch_payload(batch, rows):
     finished = [r for r in rows if r.call_outcome]
     return {
         "id": batch.id,
+        "number": batch.number,
         "status": batch.status,
         "source_filename": batch.source_filename,
         "running": batch.status == CallBatch.STATUS_RUNNING,
         "stop_requested": batch_state["batch_id"] == batch.id and batch_state["stop_requested"],
         "total": len(rows),
         "done": len(finished),
-        "succeeded": sum(1 for r in finished if r.call_outcome == "success"),
+        "verified": sum(1 for r in finished if r.verification == "verified"),
         "rows": [
             {
                 "row_number": r.row_number,
                 "destination_number": r.destination_number,
                 "extension": r.extension,
                 "claim_context": r.claim_context,
-                "status": r.status_label,
+                "status": r.status_label,  # Verified / Unverified / Queued / In progress
+                "verification": r.verification,
+                "outcome": r.call_outcome,
+                "reason": r.reason_label,
                 "fields_captured": r.fields_captured,
                 "error": r.error,
             }
@@ -413,6 +418,8 @@ def get_results(request):
     if RESULTS_FILE.exists():
         raw = json.loads(RESULTS_FILE.read_text())
         for key, entry in raw.items():
+            if key == "call_stage":  # bookkeeping, not something the rep told us
+                continue
             fields[key] = {
                 "label": FIELD_LABELS.get(key, key),
                 "value": entry["value"],

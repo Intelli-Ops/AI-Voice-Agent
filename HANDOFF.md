@@ -147,19 +147,31 @@ run.py                 Runs the app via uvicorn against the ASGI app (NOT
   status fetch every 20s in case the webhook is lost) *and* for `/ws` to
   finish syncing results to the database before it clears
   `call_results.json` and dials the next row. A connected call that ends
-  with no outcome from the pipeline (e.g. the rep hung up) is recorded as
-  `incomplete`.
+  with no outcome from the pipeline (e.g. the rep hung up) is judged from
+  what it captured (next point).
 - **The batch loop is an asyncio task inside the web process.** A server
   restart kills it — and `run.py` uses `reload=True`, so *saving any
   `.py` file while a batch is running stops the batch*. The next page
   load marks such a batch `interrupted` and its remaining rows
   `not_called`; it is not resumed.
-- **Outcome is judged on the data captured, not on who hung up.**
-  `main.outcome_from_captured()`: `success` = claim confirmed + claim
-  status + adjuster name + at least one of phone/email/fax; `partial` =
-  claim confirmed but some of that missing; `incomplete` = connected but
-  claim never confirmed. Applied when Emily ends the call (end_call) and
-  when it ends any other way (rep hangs up, silence timeout).
+- **Two statuses: Verified / Unverified (CTO's decision, 2026-10-16).**
+  Verified = the rep confirmed the claim; adjuster details are not
+  required. Everything else is Unverified, with the reason stored in
+  `call_outcome` (claim not confirmed, stuck in phone menu, no answer,
+  busy, call failed, canceled, not called, system error). Judged by
+  `main.outcome_from_captured()` from the data captured, however the call
+  ended. Labels live in `CallLog.OUTCOME_LABELS`.
+- **Emily's opening line runs with no tools.** With tools attached the
+  model sometimes called one in the same reply as its greeting (saving
+  "claim confirmed" before the rep spoke, or end_call), and Pipecat's
+  re-run for the tool result made her repeat the whole greeting or stall.
+  `ContextTrimmer._maybe_enable_tools` switches tools on from the turn
+  after the opening.
+- **Known extension timing.** Sent 5s after the /ws leg connects
+  (`EXTENSION_DIAL_DELAY`), not 5s after the menu is detected (detection
+  itself takes ~5s; the test line's menu had given up by then). The
+  second leg may redial once if the menu asks again
+  (`MAX_EXTENSION_LEGS`).
 
 ## Environment variables needed (`.env`, never committed)
 

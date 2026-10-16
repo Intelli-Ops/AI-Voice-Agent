@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.extensions.ivr.ivr_navigator import IVRNavigator, IVRStatus
 from pipecat.frames.frames import (
     EndFrame,
+    LLMContextFrame,
     LLMMessagesUpdateFrame,
     LLMRunFrame,
     LLMSetToolsFrame,
@@ -115,7 +117,9 @@ def load_claims_from_excel(file_path) -> list[dict]:
 
     Returns a list of dicts, each with: destination_number, extension,
     claim_context (a dict with the 4 REQUIRED_CLAIM_FIELDS keys), and
-    row_number (1-indexed, matching what the user sees in Excel, for error
+    row_number (the claim's position under the header: the first row of
+    data is 1, i.e. Excel row 2; blank rows still count, so row N is always
+    Excel row N+1), for error
     messages).
     """
     from openpyxl import load_workbook
@@ -148,7 +152,7 @@ def load_claims_from_excel(file_path) -> list[dict]:
             )
 
         claims = []
-        for row_number, row in enumerate(rows_iter, start=2):  # row 1 is the header
+        for row_number, row in enumerate(rows_iter, start=1):  # header excluded: first data row is 1
             if row is None or all(c is None for c in row):
                 continue  # skip fully blank rows
 
@@ -164,7 +168,10 @@ def load_claims_from_excel(file_path) -> list[dict]:
             if not destination_number:
                 missing.append("destination_number")
             if missing:
-                logger.warning(f"Excel row {row_number}: skipped, missing {', '.join(missing)}")
+                logger.warning(
+                    f"Claims sheet row {row_number} (Excel row {row_number + 1}): skipped, "
+                    f"missing {', '.join(missing)}"
+                )
                 continue
 
             claims.append(
@@ -310,6 +317,9 @@ the question, changes the subject, or just says goodbye, do not ask again
 says goodbye or makes clear they're done, say goodbye and call end_call
 rather than pressing for whatever is still missing.
 
+Never call any tool in the same reply as your opening line -- nothing has
+been confirmed yet at that point.
+
 NEVER call end_call anywhere else -- not after your opening line, not after
 a single question, not just because a sentence felt complete. It is ONLY
 for turn B above: after the literal spoken goodbye, at the very end of a
@@ -362,6 +372,20 @@ def clear_results():
         RESULTS_FILE.unlink()
 
 
+# Keys in call_results.json that are bookkeeping, not information collected
+# from the rep: kept out of "captured fields" everywhere they're shown.
+# call_stage is "phone_menu" once an automated menu answered and
+# "conversation" once a person did -- it tells a call that died in the menu
+# apart from one where a person never confirmed the claim.
+INTERNAL_RESULT_KEYS = ("call_outcome", "call_stage")
+
+
+def captured_fields(results: dict) -> dict:
+    """{field: value} for the information collected on the call, from a
+    call_results.json dict."""
+    return {k: v["value"] for k, v in results.items() if k not in INTERNAL_RESULT_KEYS}
+
+
 def _collected_fields_status() -> str:
     """A deterministic "here's what's already confirmed" line, read straight
     from call_results.json. Used instead of trusting the LLM's own fuzzy
@@ -369,10 +393,10 @@ def _collected_fields_status() -> str:
     summary was observed losing adjuster info entirely (it only mentioned
     claim details) once the sliding window trimmed the actual exchange out,
     causing the model to re-ask for a name/phone it had already saved."""
-    results = _load_results()
-    if not results:
+    fields = captured_fields(_load_results())
+    if not fields:
         return ""
-    parts = [f"{field} = {entry['value']}" for field, entry in results.items()]
+    parts = [f"{field} = {value}" for field, value in fields.items()]
     return "Already confirmed, do NOT ask for these again: " + "; ".join(parts)
 
 
@@ -390,25 +414,20 @@ def _save(field_name: str, value: str):
 # no_answer / busy / failed (set from Twilio's own call status callback,
 # since those calls never even reach our pipeline to record anything else),
 # error (the pipeline itself crashed).
-# What a call has to have collected to count as a success, whether or not it
-# ended with Emily's own goodbye: the claim confirmed, its status, the
-# adjuster's name, and at least one way to reach them.
-SUCCESS_REQUIRED_FIELDS = ("claim_confirmed", "claim_status", "adjuster_name")
-ADJUSTER_CONTACT_FIELDS = ("adjuster_phone", "adjuster_email", "adjuster_fax")
-
-
-def outcome_from_captured(fields: dict) -> str:
-    """success / partial / incomplete, judged only on what was captured.
-    fields is {field_name: value}. Used both when Emily ends the call herself
-    and when the call ends some other way (the rep hangs up, the silence
-    timeout fires), so the same data always gets the same outcome."""
-    if all(fields.get(k) for k in SUCCESS_REQUIRED_FIELDS) and any(
-        fields.get(k) for k in ADJUSTER_CONTACT_FIELDS
-    ):
-        return "success"
+# A call is "verified" when the rep confirmed the claim is on file and
+# matches -- the adjuster's details are collected when available but aren't
+# needed for that. Every other outcome is a reason the claim is unverified.
+def outcome_from_captured(fields: dict, call_stage: str = "") -> str:
+    """verified, or why not: ivr_dead_end_needs_callback (the call ended
+    while still in an automated phone menu) or claim_not_confirmed (a person
+    answered but the claim was never confirmed). fields is {field: value}.
+    Used both when Emily ends the call herself and when it ends any other
+    way (the rep hangs up, the silence timeout fires, the menu hangs up)."""
     if fields.get("claim_confirmed"):
-        return "partial"
-    return "incomplete"
+        return "verified"
+    if call_stage == "phone_menu":
+        return "ivr_dead_end_needs_callback"
+    return "claim_not_confirmed"
 
 
 def save_call_outcome_if_unset(outcome: str):
@@ -559,9 +578,7 @@ def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
                 }
             )
             return
-        save_call_outcome_if_unset(
-            outcome_from_captured({k: v["value"] for k, v in _load_results().items()})
-        )
+        save_call_outcome_if_unset("verified")  # claim_confirmed is guaranteed by the guard above
         await params.result_callback({"status": "ending_call"})
         if call_sid:
             await hang_up_twilio_call(call_sid)
@@ -597,10 +614,16 @@ class ContextTrimmer(FrameProcessor):
         openai_api_key: str,
         max_history_messages: int = 16,
         summarizer_model: str = "gpt-6-luna",
+        call_phase: dict | None = None,
+        conversation_tools: list | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._context = context
+        # Shared with the IVR/conversation handlers in _build_pipeline -- see
+        # _maybe_enable_tools.
+        self._phase = call_phase if call_phase is not None else {"mode": "conversation"}
+        self._conversation_tools = conversation_tools or []
         self._max = max_history_messages
         self._summary = ""
         self._summarizing = False
@@ -686,15 +709,39 @@ class ContextTrimmer(FrameProcessor):
         finally:
             self._summarizing = False
 
+    def _maybe_enable_tools(self):
+        """Emily's opening line runs with NO tools, then tools come on for
+        every later turn.
+
+        With tools attached, the model was seen calling one in the same reply
+        as its greeting -- save_field("claim_confirmed") before the rep had
+        said a word, or end_call. Pipecat then runs the model again for the
+        tool's result, before the greeting has made it into the context, so
+        Emily said her whole opening a second time; with end_call it also
+        left the turn stuck until the rep spoke again. Keeping tools off for
+        that one reply removes both.
+
+        Called for each LLMContextFrame, i.e. each time the model is about to
+        run: the first run after a person is detected is the opening; the
+        next one (after the rep's reply) switches tools on before it goes."""
+        if self._phase["mode"] == "opening":
+            self._phase["mode"] = "opening_sent"
+        elif self._phase["mode"] == "opening_sent":
+            self._context.set_tools(self._conversation_tools)
+            self._phase["mode"] = "conversation"
+            logger.debug("ContextTrimmer: opening line done, tools enabled")
+
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         self._context.transform_messages(self._trim)
+        if isinstance(frame, LLMContextFrame) and direction == FrameDirection.DOWNSTREAM:
+            self._maybe_enable_tools()
         await self.push_frame(frame, direction)
 
 
-def _make_on_conversation_detected(vad_start_strategy, end_call_schema, system_prompt: str):
-    """Bind vad_start_strategy/end_call_schema/system_prompt into the handler
-    via closure, so it can turn real barge-in back on now that a human (not a
+def _make_on_conversation_detected(vad_start_strategy, system_prompt: str, call_phase: dict):
+    """Bind vad_start_strategy/system_prompt/call_phase into the handler via
+    closure, so it can turn real barge-in back on now that a human (not a
     looping recording) is on the line -- see the comment on
     enable_vad_interruptions in _build_pipeline for why it starts disabled."""
 
@@ -702,15 +749,11 @@ def _make_on_conversation_detected(vad_start_strategy, end_call_schema, system_p
         """A human picked up -- hand off from IVR-navigation mode back to Emily's script."""
         logger.info("IVR navigator: live conversation detected, resuming normal script")
         vad_start_strategy._enable_interruptions = True
-        # Tools were cleared on IVR detection (they don't belong in navigation mode,
-        # and left attached the model would sometimes call save_field with junk
-        # values instead of navigating) -- restore them now that a human is on the line.
-        await processor.push_frame(
-            LLMSetToolsFrame(
-                tools=[save_field_schema, save_adjuster_info_schema, end_call_schema]
-            ),
-            FrameDirection.UPSTREAM,
-        )
+        _save("call_stage", "conversation")
+        # The opening line goes out with no tools; ContextTrimmer switches them
+        # on for the next turn (see ContextTrimmer._maybe_enable_tools).
+        call_phase["mode"] = "opening"
+        await processor.push_frame(LLMSetToolsFrame(tools=NOT_GIVEN), FrameDirection.UPSTREAM)
         messages = [{"role": "system", "content": system_prompt}] + conversation_history
         await processor.push_frame(
             LLMMessagesUpdateFrame(messages=messages, run_llm=True),
@@ -752,11 +795,28 @@ async def _dial_extension_via_call_redirect(call_sid: str, extension: str):
     await asyncio.to_thread(lambda: client.calls(call_sid).update(twiml=twiml))
 
 
-def _make_on_ivr_status_changed(vad_start_strategy, known_extension: str = "", call_sid: str = ""):
+# How long after a /ws leg connects to send a known extension. Measured by
+# dialing the test line's extension by hand: pressing immediately on connect
+# doesn't register, ~5s in does. It used to be 5s after the IVR was *detected*
+# -- but detection itself takes ~5s (the model needs some of the prompt to
+# classify it), so the digits went out ~10s in, after this line's menu had
+# already given up ("We did not receive an extension") and hung up.
+EXTENSION_DIAL_DELAY = 5.0  # seconds from the leg connecting
+
+
+def _make_on_ivr_status_changed(
+    vad_start_strategy,
+    known_extension: str = "",
+    call_sid: str = "",
+    call_phase: dict | None = None,
+    leg_started_at: float | None = None,
+):
     """Bind known_extension/call_sid/vad_start_strategy into the event handler
     via closure -- add_event_handler only passes (processor, status), so this
     is how we thread extra context through."""
     dialed = False
+    call_phase = call_phase if call_phase is not None else {}
+    leg_started_at = leg_started_at if leg_started_at is not None else time.monotonic()
 
     async def _on_ivr_status_changed(processor, status):
         nonlocal dialed
@@ -769,8 +829,11 @@ def _make_on_ivr_status_changed(vad_start_strategy, known_extension: str = "", c
             # save_field/save_adjuster_info don't apply during IVR navigation --
             # left attached, the model sometimes calls them with junk values
             # instead of emitting <dtmf>/<ivr> tags. Clear them until a human
-            # picks up (on_conversation_detected restores them).
+            # picks up (ContextTrimmer switches them back on after the opening).
+            call_phase["mode"] = "ivr"
             await processor.push_frame(LLMSetToolsFrame(tools=NOT_GIVEN), FrameDirection.UPSTREAM)
+            if _load_results().get("call_stage", {}).get("value") != "conversation":
+                _save("call_stage", "phone_menu")
         if status == IVRStatus.DETECTED and known_extension and not dialed:
             dialed = True
             logger.info(
@@ -778,10 +841,9 @@ def _make_on_ivr_status_changed(vad_start_strategy, known_extension: str = "", c
                 f"extension {known_extension!r} (dialing too early, while the system is "
                 f"still playing its greeting, gets ignored even though the tones are sent)"
             )
-            # Confirmed by manually dialing this same extension by hand: pressing
-            # immediately on connect doesn't register, but pressing ~5s in does --
-            # the system isn't listening for DTMF until its prompt audio finishes.
-            await asyncio.sleep(5)
+            # See EXTENSION_DIAL_DELAY: timed from the leg connecting, not from
+            # detection.
+            await asyncio.sleep(max(0.0, EXTENSION_DIAL_DELAY - (time.monotonic() - leg_started_at)))
 
             if call_sid:
                 # Real Twilio call -- use the native redirect mechanism, since
@@ -901,14 +963,24 @@ def _build_pipeline(
         sample_rate=sample_rate,
     )
 
+    leg_started_at = time.monotonic()
     system_prompt = _build_system_prompt(claim_context or DEFAULT_CLAIM_CONTEXT)
     end_call_schema = make_end_call_schema(call_sid)
+    conversation_tools = [save_field_schema, save_adjuster_info_schema, end_call_schema]
+    # Which stage the call is in, shared by the IVR/conversation handlers and
+    # ContextTrimmer: "classifying" (who answered?), "ivr", "opening" /
+    # "opening_sent" (Emily's first line, no tools), "conversation" (tools on).
+    # The mic demo has no classifier step in practice -- Emily speaks first --
+    # so it starts at "opening".
+    call_phase = {"mode": "classifying" if call_sid else "opening"}
+    # No tools until Emily has said her opening line to a person (see
+    # ContextTrimmer._maybe_enable_tools) -- the IVR classifier also runs on
+    # this context and must not be able to call them either.
     context = LLMContext(
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "(The call has just connected.)"},
         ],
-        tools=[save_field_schema, save_adjuster_info_schema, end_call_schema],
     )
     # Kept as a named variable (not inline) so IVR/conversation-mode handlers
     # below can flip _enable_interruptions on it at runtime -- it needs to
@@ -933,16 +1005,24 @@ def _build_pipeline(
         "on_user_turn_stopped", _on_user_turn_stopped_reset_idle
     )
 
-    context_trimmer = ContextTrimmer(context, openai_api_key=openai_key, max_history_messages=16)
+    context_trimmer = ContextTrimmer(
+        context,
+        openai_api_key=openai_key,
+        max_history_messages=16,
+        call_phase=call_phase,
+        conversation_tools=conversation_tools,
+    )
 
     ivr_navigator = IVRNavigator(llm=llm, ivr_prompt=_build_ivr_goal(known_extension))
     ivr_navigator.add_event_handler(
         "on_conversation_detected",
-        _make_on_conversation_detected(vad_start_strategy, end_call_schema, system_prompt),
+        _make_on_conversation_detected(vad_start_strategy, system_prompt, call_phase),
     )
     ivr_navigator.add_event_handler(
         "on_ivr_status_changed",
-        _make_on_ivr_status_changed(vad_start_strategy, known_extension, call_sid),
+        _make_on_ivr_status_changed(
+            vad_start_strategy, known_extension, call_sid, call_phase, leg_started_at
+        ),
     )
 
     # DEBUG: log the raw LLM text before IVRProcessor strips <dtmf>/<ivr> tags out of

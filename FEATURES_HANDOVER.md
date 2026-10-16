@@ -1,4 +1,4 @@
-# Feature Handover: Excel Export, Call Outcomes, Excel Date Reading
+# Feature Handover: Excel Export, Verified/Unverified Statuses, Excel Date Reading
 
 This document covers three self-contained features of the AI Voice Agent:
 what each one does, where its code lives, how it works, the background
@@ -7,7 +7,7 @@ knowledge needed to understand it, how to test it, and how to change it.
 | # | Feature | Size | Main files |
 |---|---|---|---|
 | 1 | Excel export of call results | ~100 lines | `agent/services/exports.py`, `agent/views.py`, `agent/templates/agent/call_logs.html` |
-| 2 | Call outcomes judged from captured data, plus rep name and reference number | ~60 lines | `main.py`, `agent/services/batches.py`, `agent/state.py` |
+| 2 | Verified / Unverified call statuses, plus rep name and reference number | ~80 lines | `main.py`, `agent/models.py`, `agent/services/batches.py` |
 | 3 | Reading Excel dates and numbers correctly | ~15 lines | `main.py` |
 
 For the whole system (architecture, WebSockets, models, every view), see
@@ -75,7 +75,7 @@ answer to this file in the project root:
 {
   "claim_confirmed": {"value": "yes", "captured_at": "2026-10-15T06:59:10+00:00"},
   "adjuster_name":   {"value": "Dana Reyes", "captured_at": "..."},
-  "call_outcome":    {"value": "success", "captured_at": "..."}
+  "call_outcome":    {"value": "verified", "captured_at": "..."}
 }
 ```
 
@@ -109,11 +109,12 @@ Admins download call results as an `.xlsx` file from the Call Logs page:
 - **Download Excel** next to each batch: that batch only, in sheet order.
 - **Download Excel (all calls)** at the top: every call.
 
-One line per call with: Batch, Sheet Row, Destination, Extension, Client,
-Claim #, DOI, Patient, Call Status, one column per collected field (Claim
+One line per call with: Batch, Row, Destination, Extension, Client,
+Claim #, DOI, Patient, Status, Reason, one column per collected field (Claim
 Confirmed, Claim Status, Adjuster Name/Phone/Email/Fax, Rep Name,
 Reference #), Started (UTC), Ended (UTC), Placed By, Recording, Notes,
-Call SID.
+Call SID. ("Status" is Verified / Unverified; "Reason" says why a call is
+unverified -- see Feature 2.)
 
 ### Where the code is
 
@@ -184,108 +185,110 @@ Call SID.
 
 ---
 
-## Feature 2: Call outcomes judged from captured data
+## Feature 2: Verified / Unverified call statuses
 
 ### The problem it solved
 
-A call was only marked `success` if Emily herself said goodbye and called
-the `end_call` tool. In a real test, the rep gave every detail, declined to
-give their own name, and hung up. Emily never reached her goodbye, so the
-call was recorded as `incomplete` even though everything was collected.
-She was also told to wait for the rep's name and reference number, so she
-could get stuck waiting.
+Calls used to end up as success / partial / incomplete, and "success" was
+only given if Emily herself said goodbye and called the `end_call` tool. A
+rep who gave every detail and then hung up produced "incomplete". The
+statuses were also more than the business needs: the CTO asked for two.
 
 ### What it does now
 
-The outcome depends only on what was collected, however the call ended
-(Emily's goodbye, the rep hanging up, or the silence timeout):
+Every finished call is either **Verified** or **Unverified**:
 
-| Outcome | Rule |
-|---|---|
-| `success` | `claim_confirmed` + `claim_status` + `adjuster_name` + at least one of `adjuster_phone` / `adjuster_email` / `adjuster_fax` |
-| `partial` | `claim_confirmed`, but something above is missing |
-| `incomplete` | the claim was never confirmed |
+- **Verified** = the rep confirmed the claim is on file and matches (claim
+  number, date of injury, patient). Adjuster details are collected when
+  given, but aren't needed.
+- **Unverified** comes with a reason: Claim not confirmed, Stuck in phone
+  menu, No answer, Line busy, Call failed, Call canceled, Not called,
+  System error.
 
-Also:
-- Emily asks for the rep's name and a reference number **once**, saves them
-  if given (`rep_name`, `reference_number`), and says goodbye whatever the
-  answer.
-- Past calls were re-judged once with the new rule.
+It is decided from what was collected, however the call ended: Emily's
+goodbye, the rep hanging up, the silence timeout, or the phone menu
+hanging up. Emily also asks for the rep's name and a reference number
+once, saves them if given (`rep_name`, `reference_number`), and says
+goodbye whatever the answer.
 
 ### Where the code is
 
 | File | What |
 |---|---|
-| `main.py` | `SUCCESS_REQUIRED_FIELDS`, `ADJUSTER_CONTACT_FIELDS`, `outcome_from_captured(fields)` |
-| `main.py` | `end_call` handler inside `make_end_call_schema()` uses `outcome_from_captured` |
-| `main.py` | `_build_system_prompt()`: the CLOSING section (ask once, never wait) |
-| `main.py` | `save_field_schema`: field list now includes `rep_name`, `reference_number` |
+| `main.py` | `outcome_from_captured(fields, call_stage)`, `captured_fields()`, `INTERNAL_RESULT_KEYS` |
+| `main.py` | `end_call` (inside `make_end_call_schema()`) saves `verified` |
+| `main.py` | `_on_conversation_detected` / `_on_ivr_status_changed` record `call_stage` |
+| `agent/models.py` | `CallLog.OUTCOME_*`, `OUTCOME_LABELS`, and the `verification`, `reason_label`, `status_label` properties |
 | `agent/services/batches.py` | `JUDGED_OUTCOMES`, `sync_call_results()`, `record_twilio_terminal_status()` |
-| `agent/models.py` | `CallLog.OUTCOME_PARTIAL`, `CallLog.OUTCOME_INCOMPLETE` |
-| `agent/state.py` | `FIELD_LABELS` gained "Rep Name" and "Reference #" (page + Excel) |
-| `agent/templates/agent/base.html`, `index.html` | Styling for the `partial` pill and outcome bar |
+| `agent/migrations/0005_verified_status_and_batch_number.py` | Converted old rows: success/partial → verified, incomplete → claim_not_confirmed |
+| `agent/views.py` | `_batch_payload()` sends `verification`, `outcome`, `reason` per row |
+| `agent/services/exports.py` | Excel "Status" and "Reason" columns |
+| `agent/templates/agent/*.html` | Verified / Unverified pills with the reason, Batch Progress bars |
 
 ### How it works
 
-The rule is one pure function, so the same data always gives the same
-answer:
+The rule is one pure function:
 
 ```python
-SUCCESS_REQUIRED_FIELDS = ("claim_confirmed", "claim_status", "adjuster_name")
-ADJUSTER_CONTACT_FIELDS = ("adjuster_phone", "adjuster_email", "adjuster_fax")
-
-def outcome_from_captured(fields: dict) -> str:
-    if all(fields.get(k) for k in SUCCESS_REQUIRED_FIELDS) and any(
-        fields.get(k) for k in ADJUSTER_CONTACT_FIELDS
-    ):
-        return "success"
+def outcome_from_captured(fields: dict, call_stage: str = "") -> str:
     if fields.get("claim_confirmed"):
-        return "partial"
-    return "incomplete"
+        return "verified"
+    if call_stage == "phone_menu":
+        return "ivr_dead_end_needs_callback"   # shown as "Stuck in phone menu"
+    return "claim_not_confirmed"
 ```
 
-It is applied at the two places a call can end:
+`call_stage` is bookkeeping written to `call_results.json` by `main.py`:
+`phone_menu` when an automated menu answers, `conversation` when a person
+does. It is what tells "the call died in the phone menu" apart from "a
+person answered but never confirmed". It is never shown as a captured
+field (`captured_fields()` leaves it out).
 
-1. **Emily ends it** (`end_call` tool): the outcome is judged from
-   `call_results.json` and saved there; Django copies it to the row.
+The rule runs at the two places a call can end:
+
+1. **Emily ends it** (`end_call`): only allowed once `claim_confirmed` is
+   saved, so it saves `verified`.
 2. **The call ends any other way:** Twilio POSTs `/call-status` with
-   `completed` → `record_twilio_terminal_status()` → `sync_call_results(call_sid, call_over=True)`,
-   which merges the captured fields into the row and, because the pipeline
-   set no outcome, judges it with `outcome_from_captured`.
+   `completed` → `record_twilio_terminal_status()` →
+   `sync_call_results(call_sid, call_over=True)`, which merges the captured
+   fields into the row and, since the pipeline set no outcome, applies
+   `outcome_from_captured`.
 
-**Judged vs factual outcomes.** `success`, `partial`, `incomplete` (and
-empty) are *judgements* of the data and may be revised when more data
-arrives: they are listed in `JUDGED_OUTCOMES`. Outcomes like `no_answer`,
-`busy`, `error` or `ivr_dead_end_needs_callback` are *facts* about how the
-call went and are never overwritten.
+The database stores the precise code in `CallLog.call_outcome` (e.g.
+`no_answer`); the model turns it into what people see:
 
-**Safety guard kept:** `end_call` still refuses if `claim_confirmed` was
-never saved, so the model can't hang up on its first turn.
+```python
+log.verification   # "verified" / "unverified" / "" (no result yet)
+log.reason_label   # "No answer" -- only for unverified calls
+log.status_label   # "Verified" / "Unverified" / "Queued" / "In progress"
+```
+
+**Judged vs factual outcomes.** `verified`, `claim_not_confirmed` and the
+phone-menu result are judgements of the data and may be revised when more
+data arrives (`JUDGED_OUTCOMES`). `no_answer`, `busy`, `failed`, `error`
+and `not_called` are facts about the call and are never overwritten.
 
 ### How to test
 
-Without a phone call, check the rule in a Django shell:
+Without a phone call:
 
 ```bash
-python manage.py shell -c "from main import outcome_from_captured as o; print(o({'claim_confirmed':'yes','claim_status':'open','adjuster_name':'Dana','adjuster_email':'d@x.com'}), o({'claim_confirmed':'yes'}), o({}))"
-# success partial incomplete
+python manage.py shell -c "from main import outcome_from_captured as o; print(o({'claim_confirmed':'yes'}), o({}, 'phone_menu'), o({}, 'conversation'))"
+# verified ivr_dead_end_needs_callback claim_not_confirmed
 ```
 
 With a real call (playing the rep):
-1. Give every detail, refuse your name → `success`, and Emily says goodbye
-   and hangs up.
-2. Give every detail, then hang up yourself before her goodbye → `success`.
-3. Confirm the claim, give the status only, hang up → `partial`.
-4. Give your name and a reference number when asked → they appear as Rep
+1. Confirm the claim, refuse to give the adjuster's details → Verified.
+2. Confirm the claim, then hang up before Emily's goodbye → Verified.
+3. Answer but never confirm the claim, hang up → Unverified · Claim not confirmed.
+4. Don't answer → Unverified · No answer.
+5. Give your name and a reference number when asked → they appear as Rep
    Name and Reference # on the page and in the Excel export.
 
 ### How to change it
 
-- **Change what counts as success:** edit `SUCCESS_REQUIRED_FIELDS` /
-  `ADJUSTER_CONTACT_FIELDS`. Then re-judge old rows if wanted:
-  ```bash
-  python manage.py shell -c "from agent.models import CallLog; from main import outcome_from_captured as o; [CallLog.objects.filter(pk=l.pk).update(call_outcome=o(l.fields_captured)) for l in CallLog.objects.filter(call_outcome__in=['success','partial','incomplete'])]"
-  ```
+- **Change what counts as verified:** edit `outcome_from_captured`.
+- **Rename a reason as shown to people:** edit `CallLog.OUTCOME_LABELS`.
 - **Add a new captured field:** add it to the `save_field` description in
   `save_field_schema`, mention it in the prompt, and add a label in
   `FIELD_LABELS` (that also adds the Excel column and the page row).

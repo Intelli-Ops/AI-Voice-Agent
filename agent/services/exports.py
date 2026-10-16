@@ -13,7 +13,7 @@ from agent.state import FIELD_LABELS
 CAPTURED_FIELDS = [key for key in FIELD_LABELS if key != "call_outcome"]
 
 HEADERS = (
-    ["Batch", "Sheet Row", "Destination", "Extension", "Client", "Claim #", "DOI", "Patient", "Call Status"]
+    ["Batch", "Row", "Destination", "Extension", "Client", "Claim #", "DOI", "Patient", "Status", "Reason"]
     + [FIELD_LABELS[key] for key in CAPTURED_FIELDS]
     + ["Started (UTC)", "Ended (UTC)", "Placed By", "Recording", "Notes", "Call SID"]
 )
@@ -31,7 +31,8 @@ def _recording_status(call_log) -> str:
 
 def build_call_log_workbook(call_logs) -> bytes:
     """One row per call. call_logs should have placed_by, batch and
-    recordings loaded already."""
+    recordings loaded already. Status is Verified / Unverified (or Queued /
+    In progress); Reason says why an unverified call is unverified."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Call Results"
@@ -45,7 +46,7 @@ def build_call_log_workbook(call_logs) -> bytes:
         captured = log.fields_captured or {}
         values = (
             [
-                log.batch_id,
+                (log.batch.number or log.batch_id) if log.batch_id else None,
                 log.row_number,
                 log.destination_number,
                 log.extension,
@@ -54,6 +55,7 @@ def build_call_log_workbook(call_logs) -> bytes:
                 claim.get("doi", ""),
                 claim.get("patient_name", ""),
                 log.status_label,
+                log.reason_label,
             ]
             + [captured.get(key, "") for key in CAPTURED_FIELDS]
             + [

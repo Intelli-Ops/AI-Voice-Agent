@@ -83,15 +83,15 @@
     <div class="table-wrap">
       <table class="batch-table">
         <thead>
-          <tr><th>Batch</th><th>Sheet</th><th>Status</th><th>Successful</th><th>Started</th><th>Started By</th><th></th></tr>
+          <tr><th>Batch</th><th>Sheet</th><th>Status</th><th>Verified</th><th>Started</th><th>Started By</th><th></th></tr>
         </thead>
         <tbody>
           {% for batch in batches %}
           <tr>
-            <td><b>#{{ batch.id }}</b></td>
+            <td><b>{{ batch.number|default:batch.id }}</b></td>
             <td>{{ batch.source_filename|default:"—" }}</td>
             <td><span class="pill {% if batch.status == 'completed' %}pill-success{% elif batch.status == 'running' %}pill-in_progress{% else %}pill-busy{% endif %}">{{ batch.status }}</span></td>
-            <td>{{ batch.succeeded }} of {{ batch.total }}</td>
+            <td>{{ batch.verified }} of {{ batch.total }}</td>
             <td>{{ batch.created_at|date:"M j, g:i A" }}</td>
             <td>{{ batch.created_by.username|default:"—" }}</td>
             <td style="text-align:right;"><a class="btn btn-secondary btn-sm" href="{% url 'call-logs-export' %}?batch={{ batch.id }}">Download Excel</a></td>
@@ -107,18 +107,23 @@
     <div class="card-head"><h2>Recent Calls</h2></div>
     <ul class="calls">
       {% for log in logs %}
-      {% with status=log.status_label %}
+      {% with v=log.verification outcome=log.call_outcome %}
       <li class="call">
-        <span class="call-icon {% if status == 'success' %}success{% elif status == 'failed' or status == 'error' %}bad{% elif status == 'in progress' %}live{% elif status == 'queued' or status == 'not_called' %}{% else %}warn{% endif %}">
-          {% if status == 'success' %}&#10003;{% elif status == 'failed' or status == 'error' %}&#10005;{% elif status == 'in progress' %}&bull;{% elif status == 'queued' or status == 'not_called' %}&ndash;{% else %}!{% endif %}
+        <span class="call-icon {% if v == 'verified' %}success{% elif outcome == 'failed' or outcome == 'error' %}bad{% elif not outcome and log.call_sid %}live{% elif not outcome or outcome == 'not_called' %}{% else %}warn{% endif %}">
+          {% if v == 'verified' %}&#10003;{% elif outcome == 'failed' or outcome == 'error' %}&#10005;{% elif not outcome and log.call_sid %}&bull;{% elif not outcome or outcome == 'not_called' %}&ndash;{% else %}!{% endif %}
         </span>
         <div class="call-main">
           <div class="call-top">
             <div>
               <div class="call-number">{{ log.destination_number }}{% if log.extension %}<small>ext. {{ log.extension }}</small>{% endif %}</div>
               <div class="chips">
-                <span class="pill pill-{{ status|cut:' ' }}{% if status == 'in progress' %} pill-in_progress{% endif %}">{{ status|humanize_key }}</span>
-                {% if log.batch_id %}<span class="pill pill-brand">Batch #{{ log.batch_id }} · Row {{ log.row_number }}</span>{% endif %}
+                {% if v %}
+                  <span class="pill pill-{{ v }}">{{ log.status_label }}</span>
+                  {% if log.reason_label %}<span class="pill pill-reason">{{ log.reason_label }}</span>{% endif %}
+                {% else %}
+                  <span class="pill {% if log.call_sid %}pill-in_progress{% else %}pill-neutral{% endif %}">{{ log.status_label }}</span>
+                {% endif %}
+                {% if log.batch_id %}<span class="pill pill-brand">Batch {{ log.batch.number|default:log.batch_id }} · Row {{ log.row_number }}</span>{% endif %}
               </div>
             </div>
             <div class="call-when">

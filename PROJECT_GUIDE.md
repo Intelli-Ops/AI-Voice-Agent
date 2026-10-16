@@ -500,7 +500,8 @@ plus `call_outcome` once known.
 | `clear_results()` | Delete the file (done when a new call is placed). |
 | `_save(field_name, value)` | Write one field with a timestamp. |
 | `_collected_fields_status()` | The "Already confirmed, do NOT ask for these again" line for the LLM. |
-| `outcome_from_captured(fields)` | `success` / `partial` / `incomplete` from `{field: value}` (§16). |
+| `outcome_from_captured(fields, call_stage)` | `verified`, or `ivr_dead_end_needs_callback` / `claim_not_confirmed` (§16). |
+| `captured_fields(results)` | `{field: value}` from the results file, without the bookkeeping keys `call_outcome` / `call_stage`. |
 | `save_call_outcome_if_unset(outcome)` | Set `call_outcome` only if none is set yet, so a specific outcome is never overwritten by a later, vaguer one. |
 
 ### Tools
@@ -708,7 +709,7 @@ One row per real call (mic demo calls are not logged).
 | Field | Type | Notes |
 |---|---|---|
 | `batch` | FK → `CallBatch`, null | `related_name="calls"` |
-| `row_number` | int, null | Sheet row, for batch calls |
+| `row_number` | int, null | Batch calls: the claim's row in the sheet, 1 = first row under the header (Excel row 2) |
 | `call_sid` | varchar(64), unique, null | Twilio's call ID; null = queued, not dialed yet |
 | `destination_number` | varchar(32) | |
 | `extension` | varchar(16) | |
@@ -799,7 +800,7 @@ The Google client is synchronous, so every call runs in `asyncio.to_thread`.
 ### `agent/services/exports.py`
 
 `build_call_log_workbook(call_logs)` → `.xlsx` bytes. One row per call with
-columns: Batch, Sheet Row, Destination, Extension, Client, Claim #, DOI,
+columns: Batch, Row, Destination, Extension, Client, Claim #, DOI,
 Patient, Call Status, then one column per captured field (from
 `FIELD_LABELS`: Claim Confirmed, Claim Status, Adjuster Name/Phone/Email/Fax,
 Rep Name, Reference #), Started (UTC), Ended (UTC), Placed By, Recording,
@@ -825,21 +826,30 @@ restart. The database is the durable record.
 
 ## 16. Call outcomes
 
-| Outcome | Set by | Meaning |
-|---|---|---|
-| `success` | `outcome_from_captured` | Claim confirmed + claim status + adjuster name + at least one adjuster phone/email/fax |
-| `partial` | `outcome_from_captured` | Claim confirmed, some of the above missing |
-| `incomplete` | `outcome_from_captured` | Connected, claim never confirmed |
-| `ivr_dead_end_needs_callback` | IVR STUCK handler | Stuck in a phone menu; call a person manually |
-| `no_answer` / `busy` / `failed` / `canceled` | Twilio status callback | Call never connected |
-| `failed` (with Notes) | `run_batch` | Twilio refused to place the call (e.g. invalid number) |
-| `error` | Pipeline exception | The voice pipeline crashed |
-| `not_called` | Batch stop/interrupt | Never dialed |
-| *(queued / in progress)* | `status_label` | No outcome yet |
+Every finished call is **Verified** or **Unverified**. Verified means the
+rep confirmed the claim (claim number, DOI, patient); adjuster details are
+collected when given but are not required. `call_outcome` stores
+`verified` or the reason the call is unverified:
 
-The first three are judged the same way whether Emily ends the call or the
-rep hangs up or silence ends it, and can be revised upward when more data
-arrives. The others are facts and are never overwritten.
+| `call_outcome` | Shown as | Set by | Meaning |
+|---|---|---|---|
+| `verified` | Verified | `outcome_from_captured` / `end_call` | Claim confirmed |
+| `claim_not_confirmed` | Unverified · Claim not confirmed | `outcome_from_captured` | A person answered; claim never confirmed |
+| `ivr_dead_end_needs_callback` | Unverified · Stuck in phone menu | IVR STUCK handler, or `outcome_from_captured` when the call ended still in the menu | Call a person manually |
+| `no_answer` / `busy` / `canceled` | Unverified · No answer / Line busy / Call canceled | Twilio status callback | Never connected |
+| `failed` | Unverified · Call failed | Twilio callback, or `run_batch` with a Notes message | Couldn't be placed |
+| `not_called` | Unverified · Not called | Batch stop/interrupt | Never dialed |
+| `error` | Unverified · System error | Pipeline exception | The voice pipeline crashed |
+| *(empty)* | Queued / In progress | — | No outcome yet |
+
+`verified`, `claim_not_confirmed` and the phone-menu result are judgements
+of the captured data (`JUDGED_OUTCOMES`) and may be revised when more data
+arrives; the rest are facts and never overwritten. To tell a call that died
+in the menu from one where a person never confirmed, `main.py` records
+`call_stage` (`phone_menu` / `conversation`) in `call_results.json`; it is
+bookkeeping and never shown as a captured field. Display labels are
+`CallLog.OUTCOME_LABELS`; `CallLog.verification`, `reason_label` and
+`status_label` turn an outcome into what the pages and Excel show.
 
 ## 17. Google Drive OAuth
 
@@ -875,7 +885,7 @@ and status pills for every outcome.
   - Live call panel (status, number, timer, claim details, hang-up button),
     Single Call controls (pick a row or type a number; Place Real Call / Mic
     Demo), Captured Information.
-  - Batch Progress: rows/called/successful and outcome bars.
+  - Batch Progress: rows/called/verified and one bar per result (Verified, each Unverified reason).
 
   It polls `/api/results` every 1 s and `/api/batch` every 2 s. All
   call-derived text is inserted with `textContent`, never `innerHTML`.
@@ -950,7 +960,11 @@ new database, create the admin user, reconnect Drive, restart.
   `PUBLIC_BASE_URL`, `GOOGLE_DRIVE_REDIRECT_URI` and the URI in Google Cloud.
 - **`end_call` needs `claim_confirmed`.** If a rep can't find the claim, Emily
   can't hang up herself; the silence timeout or the rep ends the call
-  (outcome `incomplete`). A "claim not found" path is a possible improvement.
+  (Unverified · Claim not confirmed). A "claim not found" path is a possible improvement.
+- **The phone-menu navigator's own key presses** (`<dtmf>0</dtmf>` when no
+  extension is known) are sent as audio tones over the Media Stream, which
+  phone systems don't reliably recognize. Only the known extension uses
+  Twilio's real DTMF.
 - **Speech recognition errors** (names, digits) are handled by confirming
   back and spelling out, not eliminated.
 - **Prototype security:** `ALLOWED_HOSTS = ["*"]`, fallback secret key,

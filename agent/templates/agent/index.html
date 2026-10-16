@@ -207,7 +207,7 @@
       <div class="stats">
         <div class="stat"><b id="statRows">0</b><span>Rows</span></div>
         <div class="stat"><b id="statCalled">0</b><span>Called</span></div>
-        <div class="stat"><b id="statSuccess">0</b><span>Successful</span></div>
+        <div class="stat"><b id="statSuccess">0</b><span>Verified</span></div>
       </div>
       <h2 style="font-size:13px;margin-bottom:12px;">Call Outcomes</h2>
       <div id="outcomeBars"><div class="empty">Upload a sheet to see outcomes.</div></div>
@@ -269,8 +269,18 @@ function capturedSummary(fields) {
   return Object.entries(fields || {}).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`).join(' · ');
 }
 
-function statusPill(status) {
-  return el('span', 'pill pill-' + status.replace(/ /g, '_'), status.replace(/_/g, ' '));
+// r.verification is "verified" / "unverified" once the call has an outcome;
+// before that the row is ready (uploaded, no batch yet), queued or in progress.
+function statusPills(r) {
+  const wrap = el('div', 'row-status');
+  if (r.verification) {
+    wrap.appendChild(el('span', 'pill pill-' + r.verification, r.status));
+    if (r.reason) wrap.appendChild(el('span', 'pill pill-reason', r.reason));
+  } else {
+    const key = (r.status || '').toLowerCase().replace(/ /g, '_');
+    wrap.appendChild(el('span', 'pill ' + (key === 'in_progress' ? 'pill-in_progress' : 'pill-neutral'), r.status));
+  }
+  return wrap;
 }
 
 // rows: [{row_number, destination_number, extension, claim_context, status, fields_captured, error}]
@@ -291,9 +301,9 @@ function renderBatchRows(rows) {
       captured.title = detail;  // full text on hover; the line is clamped to two lines
       body.appendChild(captured);
     }
-    // Under the text rather than beside it: "ivr dead end needs callback"
+    // Under the text rather than beside it: "Unverified · Stuck in phone menu"
     // is long enough to squeeze the patient name off a narrow column.
-    body.appendChild(statusPill(r.status));
+    body.appendChild(statusPills(r));
     item.appendChild(body);
     list.appendChild(item);
   }
@@ -301,20 +311,30 @@ function renderBatchRows(rows) {
   renderOutcomes(rows);
 }
 
-const OUTCOME_COLOR = {
-  success: 'c-success', failed: 'c-bad', error: 'c-bad',
-  no_answer: 'c-warn', busy: 'c-warn', canceled: 'c-warn', incomplete: 'c-warn', partial: 'c-warn', ivr_dead_end_needs_callback: 'c-warn',
-  ready: 'c-idle', queued: 'c-idle', not_called: 'c-idle',
-};
+// One bar per distinct result: "Verified", each unverified reason, and rows
+// not finished yet.
+function outcomeKey(r) {
+  if (r.verification === 'verified') return {label: 'Verified', color: 'c-success'};
+  if (r.verification === 'unverified') {
+    const bad = r.outcome === 'failed' || r.outcome === 'error';
+    const idle = r.outcome === 'not_called';
+    return {label: 'Unverified · ' + r.reason, color: bad ? 'c-bad' : idle ? 'c-idle' : 'c-warn'};
+  }
+  return {label: r.status, color: r.status === 'In progress' ? '' : 'c-idle'};
+}
 
 function renderOutcomes(rows) {
-  const notCalled = new Set(['ready', 'queued', 'in progress', 'not_called']);
   document.getElementById('statRows').textContent = rows.length;
-  document.getElementById('statCalled').textContent = rows.filter(r => !notCalled.has(r.status)).length;
-  document.getElementById('statSuccess').textContent = rows.filter(r => r.status === 'success').length;
+  document.getElementById('statCalled').textContent = rows.filter(r => r.verification && r.outcome !== 'not_called').length;
+  document.getElementById('statSuccess').textContent = rows.filter(r => r.verification === 'verified').length;
 
   const counts = {};
-  rows.forEach(r => { counts[r.status] = (counts[r.status] || 0) + 1; });
+  const colors = {};
+  rows.forEach(r => {
+    const k = outcomeKey(r);
+    counts[k.label] = (counts[k.label] || 0) + 1;
+    colors[k.label] = k.color;
+  });
   const box = document.getElementById('outcomeBars');
   box.innerHTML = '';
   if (!rows.length) { box.appendChild(el('div', 'empty', 'Upload a sheet to see outcomes.')); return; }
@@ -322,10 +342,10 @@ function renderOutcomes(rows) {
     const pct = Math.round((n / rows.length) * 100);
     const row = el('div', 'bar-row');
     const label = el('div', 'bar-label');
-    label.appendChild(el('span', '', status.replace(/_/g, ' ')));
+    label.appendChild(el('span', '', status));
     label.appendChild(el('span', '', `${n} · ${pct}%`));
     const bar = el('div', 'bar');
-    const fill = el('i', OUTCOME_COLOR[status] || '');
+    const fill = el('i', colors[status] || '');
     fill.style.width = pct + '%';
     bar.appendChild(fill);
     row.appendChild(label);
@@ -336,7 +356,7 @@ function renderOutcomes(rows) {
 
 function showUploadedRows() {
   batchShown = false;
-  renderBatchRows(loadedClaims.map(c => ({...c, status: 'ready', fields_captured: {}, error: ''})));
+  renderBatchRows(loadedClaims.map(c => ({...c, status: 'Ready', verification: '', fields_captured: {}, error: ''})));
   document.getElementById('batchSummary').textContent = `${loadedClaims.length} row(s) ready to call.`;
   updateBatchButtons();
 }
@@ -366,7 +386,7 @@ async function pollBatch() {
   if (batch) {
     batchShown = true;
     renderBatchRows(batch.rows);
-    let summary = `${batch.done} of ${batch.total} called, ${batch.succeeded} successful.`;
+    let summary = `Batch ${batch.number}: ${batch.done} of ${batch.total} done, ${batch.verified} verified.`;
     if (batch.running) summary = (batch.stop_requested ? 'Stopping after the current call. ' : 'Batch running. ') + summary;
     else summary = `Batch ${batch.status}. ` + summary;
     document.getElementById('batchSummary').textContent = summary;

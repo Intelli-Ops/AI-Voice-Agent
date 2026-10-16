@@ -18,7 +18,13 @@ from django.utils import timezone
 from loguru import logger
 from twilio.rest import Client as TwilioClient
 
-from main import clear_results, load_results, outcome_from_captured, save_call_outcome_if_unset
+from main import (
+    captured_fields,
+    clear_results,
+    load_results,
+    outcome_from_captured,
+    save_call_outcome_if_unset,
+)
 
 from agent.models import CallBatch, CallLog
 from agent.state import (
@@ -33,13 +39,12 @@ from agent.state import (
 
 # Twilio's final CallStatus values -> our call_outcome. "completed" only
 # means the call connected and has now ended; what happened on it is recorded
-# by the pipeline (success/partial when Emily ends it, ivr_dead_end_needs_
-# callback, error). When the pipeline recorded nothing -- the rep hung up, or
-# the silence timeout ended it -- the outcome is judged from what was
-# captured instead (main.outcome_from_captured); "incomplete" is only the
-# placeholder until then.
+# by the pipeline (verified when Emily ends it, ivr_dead_end_needs_callback,
+# error). When the pipeline recorded nothing -- the rep hung up, or the
+# silence timeout or the phone menu ended it -- the outcome is judged from
+# what was captured instead (main.outcome_from_captured).
 TWILIO_TERMINAL_OUTCOMES = {
-    "completed": CallLog.OUTCOME_INCOMPLETE,
+    "completed": CallLog.OUTCOME_CLAIM_NOT_CONFIRMED,
     "no-answer": "no_answer",
     "busy": "busy",
     "failed": "failed",
@@ -58,10 +63,16 @@ WS_TEARDOWN_GRACE = 60  # seconds
 # cancelled -- see _cancel_lingering_pipelines.
 LINGERING_PIPELINE_GRACE = 5  # seconds
 
-# Outcomes that are only a judgement of the captured data, which a later
-# sync with more data may revise. Anything else (ivr_dead_end_needs_callback,
-# error, no_answer...) is a fact about how the call went and is left alone.
-JUDGED_OUTCOMES = ("", CallLog.OUTCOME_INCOMPLETE, CallLog.OUTCOME_PARTIAL, "success")
+# Outcomes that are a judgement of the captured data (main.outcome_from_
+# captured), which a later sync with more data may revise. The others
+# (no_answer, busy, failed, error...) are facts about how the call went and
+# are left alone.
+JUDGED_OUTCOMES = (
+    "",
+    CallLog.OUTCOME_VERIFIED,
+    CallLog.OUTCOME_CLAIM_NOT_CONFIRMED,
+    CallLog.OUTCOME_IVR_DEAD_END,
+)
 
 
 def call_in_progress() -> bool:
@@ -154,22 +165,28 @@ async def sync_call_results(call_sid: str, call_over: bool):
     if row is None:
         return
 
-    pipeline_outcome = ""
     fields = dict(row.fields_captured)
     if state["dialed_call_sid"] == call_sid:
         results = load_results()
         pipeline_outcome = results.get("call_outcome", {}).get("value", "")
-        fields.update({k: v["value"] for k, v in results.items() if k != "call_outcome"})
+        call_stage = results.get("call_stage", {}).get("value", "")
+        fields.update(captured_fields(results))
+        if pipeline_outcome:
+            outcome = pipeline_outcome
+        elif call_over and row.call_outcome in JUDGED_OUTCOMES:
+            outcome = outcome_from_captured(fields, call_stage)
+        else:
+            outcome = row.call_outcome
+    else:
+        # The results file has moved on to another call: nothing new to add.
+        # Only make sure an ended call doesn't stay without an outcome.
+        outcome = row.call_outcome
+        if call_over and not outcome:
+            outcome = outcome_from_captured(fields)
 
     update = {}
     if fields != row.fields_captured:
         update["fields_captured"] = fields
-    if pipeline_outcome:
-        outcome = pipeline_outcome
-    elif call_over and row.call_outcome in JUDGED_OUTCOMES:
-        outcome = outcome_from_captured(fields)
-    else:
-        outcome = row.call_outcome
     if outcome != row.call_outcome:
         update["call_outcome"] = outcome
     if outcome and row.ended_at is None:
@@ -321,7 +338,10 @@ async def start_batch(claims: list[dict], user, source_filename: str = "") -> Ca
     # can get in while the rows are being created.
     batch_state["starting"] = True
     try:
-        batch = await CallBatch.objects.acreate(source_filename=source_filename, created_by=user)
+        last = await CallBatch.objects.exclude(number=None).order_by("-number").afirst()
+        batch = await CallBatch.objects.acreate(
+            number=(last.number if last else 0) + 1, source_filename=source_filename, created_by=user
+        )
         await CallLog.objects.abulk_create(
             [
                 CallLog(

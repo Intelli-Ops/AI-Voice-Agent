@@ -50,6 +50,9 @@ class CallBatch(models.Model):
         (STATUS_INTERRUPTED, "Interrupted"),
     ]
 
+    # Shown to people as "Batch 1, 2, 3...". Not the database id, which also
+    # counts batches created and deleted by test runs.
+    number = models.PositiveIntegerField(null=True, blank=True)
     source_filename = models.CharField(max_length=255, blank=True)
     status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_RUNNING)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
@@ -60,7 +63,7 @@ class CallBatch(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"Batch {self.id} ({self.source_filename or 'no file name'}) -> {self.status}"
+        return f"Batch {self.number} ({self.source_filename or 'no file name'}) -> {self.status}"
 
 
 class CallLog(models.Model):
@@ -72,23 +75,35 @@ class CallLog(models.Model):
     no call_sid yet (queued) -- see status_label.
     """
 
+    # Every finished call is either Verified (the rep confirmed the claim) or
+    # Unverified, with call_outcome saying why. These are the stored values
+    # and how they're shown:
+    OUTCOME_VERIFIED = "verified"
+    OUTCOME_CLAIM_NOT_CONFIRMED = "claim_not_confirmed"  # a person answered, claim never confirmed
+    OUTCOME_IVR_DEAD_END = "ivr_dead_end_needs_callback"  # stuck in / ended in a phone menu
     OUTCOME_NOT_CALLED = "not_called"  # batch stopped/interrupted before reaching this row
-    # A connected call is judged on what it captured (main.outcome_from_captured):
-    # success, partial (claim confirmed but details missing), or incomplete
-    # (not even the claim confirmed).
-    OUTCOME_PARTIAL = "partial"
-    OUTCOME_INCOMPLETE = "incomplete"
+    OUTCOME_LABELS = {
+        OUTCOME_VERIFIED: "Verified",
+        OUTCOME_CLAIM_NOT_CONFIRMED: "Claim not confirmed",
+        OUTCOME_IVR_DEAD_END: "Stuck in phone menu",
+        "no_answer": "No answer",
+        "busy": "Line busy",
+        "failed": "Call failed",
+        "canceled": "Call canceled",
+        OUTCOME_NOT_CALLED: "Not called",
+        "error": "System error",
+    }
 
     batch = models.ForeignKey(CallBatch, on_delete=models.SET_NULL, null=True, blank=True, related_name="calls")
-    row_number = models.PositiveIntegerField(null=True, blank=True)  # the sheet's row, for batch calls
+    # Batch calls: the claim's row in the sheet, counted from 1 below the header
+    # (row 1 = Excel row 2).
+    row_number = models.PositiveIntegerField(null=True, blank=True)
     call_sid = models.CharField(max_length=64, unique=True, null=True, blank=True, db_index=True)
     destination_number = models.CharField(max_length=32)
     extension = models.CharField(max_length=16, blank=True)
     claim_context = models.JSONField(default=dict)
-    # Mirrors main.py's save_call_outcome_if_unset values: success,
-    # ivr_dead_end_needs_callback, no_answer, busy, failed, canceled, error,
-    # plus the two OUTCOME_* values above, or "" while the call is queued or
-    # still in progress.
+    # One of the OUTCOME_LABELS keys, or "" while the call is queued or still
+    # in progress.
     call_outcome = models.CharField(max_length=32, blank=True)
     fields_captured = models.JSONField(default=dict)
     error = models.TextField(blank=True)  # why the call couldn't be placed, if it couldn't
@@ -101,10 +116,25 @@ class CallLog(models.Model):
         ordering = ["-started_at"]
 
     @property
+    def verification(self):
+        """"verified", "unverified", or "" while there's no outcome yet."""
+        if not self.call_outcome:
+            return ""
+        return "verified" if self.call_outcome == self.OUTCOME_VERIFIED else "unverified"
+
+    @property
+    def reason_label(self):
+        """Why an unverified call is unverified ("No answer"...); blank otherwise."""
+        if self.verification != "unverified":
+            return ""
+        return self.OUTCOME_LABELS.get(self.call_outcome, self.call_outcome.replace("_", " ").capitalize())
+
+    @property
     def status_label(self):
+        """Verified / Unverified, or Queued / In progress before there's an outcome."""
         if self.call_outcome:
-            return self.call_outcome
-        return "in progress" if self.call_sid else "queued"
+            return self.verification.capitalize()
+        return "In progress" if self.call_sid else "Queued"
 
     def __str__(self):
         return f"{self.destination_number} @ {self.started_at:%Y-%m-%d %H:%M} -> {self.status_label}"

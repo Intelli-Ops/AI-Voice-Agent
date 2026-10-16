@@ -12,7 +12,15 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from main import run_call_twilio, save_call_outcome_if_unset
 
 from .services.batches import sync_call_results
-from .state import call_claim_context, call_pending_extension, call_runners, call_terminal_status, state
+from .state import (
+    MAX_EXTENSION_LEGS,
+    call_claim_context,
+    call_extension_legs,
+    call_pending_extension,
+    call_runners,
+    call_terminal_status,
+    state,
+)
 
 
 async def _run_call_twilio_bg(websocket, stream_sid, call_sid, extension="", claim_context=None):
@@ -85,9 +93,13 @@ async def websocket_application(scope, receive, send):
     except (WebSocketDisconnect, StopAsyncIteration, KeyError):
         return
 
-    # extension is pop-once (only dial it on the first leg); claim_context
-    # is a plain get, so it's still there after a DTMF-redirect reconnect.
-    extension = call_pending_extension.pop(call_sid, "")
+    # The extension goes to the first MAX_EXTENSION_LEGS legs only (see
+    # state.py); claim_context is kept for every leg of the call.
+    extension = ""
+    if call_extension_legs.get(call_sid, 0) < MAX_EXTENSION_LEGS:
+        extension = call_pending_extension.get(call_sid, "")
+        if extension:
+            call_extension_legs[call_sid] = call_extension_legs.get(call_sid, 0) + 1
     claim_context = call_claim_context.get(call_sid)
     await _run_call_twilio_bg(
         websocket,

@@ -27,12 +27,15 @@ state = {
     "ws_active": 0,
 }
 
-# call_sid -> extension, consumed (POPPED) the first time /ws sees that
-# call_sid. Needed because dialing a known extension triggers a TwiML
-# redirect that disconnects and reconnects /ws for the SAME call -- without
-# popping, the second connection would see the same extension again and
-# redirect forever.
+# call_sid -> the known extension to dial for that call. Dialing it triggers
+# a TwiML redirect that disconnects and reconnects /ws for the SAME call, so
+# each new leg could see it again. call_extension_legs counts the legs that
+# have been handed the extension: the first leg dials it; the second one
+# only redials if the phone menu is detected again (e.g. "We did not receive
+# an extension"), and no leg after that gets it -- so it can't loop forever.
 call_pending_extension: dict[str, str] = {}
+call_extension_legs: dict[str, int] = {}
+MAX_EXTENSION_LEGS = 2
 
 # call_sid -> claim_context, kept (NOT popped) for the lifetime of the call.
 # Must survive every /ws reconnect (not just the first leg) -- see app.py's
