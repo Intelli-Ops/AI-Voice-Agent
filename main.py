@@ -292,6 +292,11 @@ HANDLING COMMON SITUATIONS
   clearly, spelling out digits if asked.
 - If the rep can't find the claim: double-check the DOI and offer to search
   by patient name instead of claim number.
+- If the claim still can't be found or doesn't match after that, or the rep
+  can't or won't give the information: don't keep pressing. Go to the
+  CLOSING below (thank them, ask once for their name and a reference
+  number, then say goodbye and call end_call). The call is recorded as
+  unverified -- that's a normal outcome, not a failure on your part.
 - If interrupted mid-sentence: stop talking immediately and listen.
 
 CLOSING -- this is TWO separate turns, not one:
@@ -322,9 +327,13 @@ been confirmed yet at that point.
 
 NEVER call end_call anywhere else -- not after your opening line, not after
 a single question, not just because a sentence felt complete. It is ONLY
-for turn B above: after the literal spoken goodbye, at the very end of a
-call where the claim has already been confirmed and there is truly nothing
-left to ask.
+for turn B above: after the literal spoken goodbye, at the very end of the
+call, when there is truly nothing left to ask -- either the claim was
+confirmed, or it couldn't be found or confirmed (see HANDLING COMMON
+SITUATIONS).
+
+After your goodbye, never start the call over: don't repeat your opening
+line or the claim details.
 
 TONE
 Professional, direct, courteous. Speak in short, clear sentences -- you're on
@@ -338,10 +347,10 @@ and immediately return to the next field on the list -- don't elaborate."""
 def _build_ivr_goal(known_extension: str = "") -> str:
     extension_hint = (
         f"""The extension {known_extension} has ALREADY been entered automatically
-the moment this system was detected -- do NOT dial it yourself, even if it's
+right after the call connected -- do NOT dial it yourself, even if it's
 mentioned again below. If the system says it didn't receive an extension or
-asks again, that entry may still be processing -- respond with
-`<ivr>wait</ivr>` rather than dialing anything."""
+asks again, it is re-entered automatically -- respond with `<ivr>wait</ivr>`
+rather than dialing anything."""
         if known_extension
         else "If asked to enter an extension and none is known, try 0 for the operator."
     )
@@ -547,7 +556,13 @@ async def hang_up_twilio_call(call_sid: str):
         logger.warning(f"Failed to hang up Twilio call {call_sid}: {exc}")
 
 
-def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
+# The rep must have replied at least this many times before Emily may hang up
+# on a call where the claim was never confirmed. Stops a premature hang-up
+# early in the call while still letting a "claim not found" call end.
+MIN_REP_TURNS_TO_END_UNCONFIRMED = 3
+
+
+def make_end_call_schema(call_sid: str = "", call_phase: dict | None = None) -> FunctionSchema:
     """Build the end_call tool, bound to this specific call's call_sid via closure.
 
     Nothing currently tells the pipeline the call is over after Emily's
@@ -559,26 +574,37 @@ def make_end_call_schema(call_sid: str = "") -> FunctionSchema:
     doesn't tear down the call on its own in every configuration).
     """
 
+    phase = call_phase if call_phase is not None else {}
+
     async def end_call(params: FunctionCallParams):
-        # Hard guard: observed the model call this on its very first turn,
-        # right after the opening greeting, before the rep had said anything
-        # -- hanging up the call before any real work happened. The prompt
-        # alone wasn't a strong enough constraint for something this costly,
-        # so refuse outright unless the claim has actually been confirmed.
-        if "claim_confirmed" not in _load_results():
+        # Guard against hanging up too early. It used to refuse whenever the
+        # claim wasn't confirmed -- which also meant a call where the claim
+        # genuinely couldn't be found or didn't match could never end: Emily
+        # said goodbye, was refused, and kept talking (even restarted her
+        # opening) until the rep hung up. Observed 2026-10-19.
+        # The model calling this on its first turn was the original reason
+        # for the guard; that is now prevented structurally (no tools during
+        # the opening line, see ContextTrimmer._maybe_enable_tools), so here
+        # it's enough to require a real exchange before an unconfirmed ending.
+        results = _load_results()
+        confirmed = "claim_confirmed" in results
+        rep_turns = phase.get("rep_turns", MIN_REP_TURNS_TO_END_UNCONFIRMED)
+        if not confirmed and rep_turns < MIN_REP_TURNS_TO_END_UNCONFIRMED:
             logger.warning(
-                "end_call: refused -- called before claim_confirmed was ever saved, "
-                "the call isn't actually done yet"
+                f"end_call: refused -- claim not confirmed and the rep has only replied "
+                f"{rep_turns} time(s)"
             )
             await params.result_callback(
                 {
                     "status": "refused",
-                    "reason": "The call is not done -- claim confirmation hasn't happened "
-                    "yet. Continue the conversation, do not end the call.",
+                    "reason": "Too early to end the call -- the conversation has barely "
+                    "started. Don't repeat your opening; carry on with the next step.",
                 }
             )
             return
-        save_call_outcome_if_unset("verified")  # claim_confirmed is guaranteed by the guard above
+        outcome = outcome_from_captured(captured_fields(results), "conversation")
+        logger.info(f"end_call: ending the call ({outcome})")
+        save_call_outcome_if_unset(outcome)
         await params.result_callback({"status": "ending_call"})
         if call_sid:
             await hang_up_twilio_call(call_sid)
@@ -795,13 +821,74 @@ async def _dial_extension_via_call_redirect(call_sid: str, extension: str):
     await asyncio.to_thread(lambda: client.calls(call_sid).update(twiml=twiml))
 
 
-# How long after a /ws leg connects to send a known extension. Measured by
-# dialing the test line's extension by hand: pressing immediately on connect
-# doesn't register, ~5s in does. It used to be 5s after the IVR was *detected*
-# -- but detection itself takes ~5s (the model needs some of the prompt to
-# classify it), so the digits went out ~10s in, after this line's menu had
-# already given up ("We did not receive an extension") and hung up.
-EXTENSION_DIAL_DELAY = 5.0  # seconds from the leg connecting
+# How long after the call is answered to press a known extension. Measured
+# by dialing the test line's extension by hand: pressing immediately on
+# connect doesn't register, ~5s in does.
+#
+# On real calls Twilio presses it itself (extension_send_digits, passed as
+# sendDigits when the call is placed). Waiting to recognize the phone menu
+# first was always too late: the menu has to pause before there's a
+# transcript to classify (~5.5s), the model takes ~1s, and Twilio takes
+# another 2-3s to act on a redirect -- ~9s in total, while the test line's
+# menu gives up after ~8s ("We did not receive an extension"). Logged on
+# 2026-10-19. The cost: if a person answers instead of a menu, they hear the
+# keypad tones before Emily speaks.
+EXTENSION_DIAL_DELAY = 5.0  # seconds from the call being answered
+
+# Twilio's sendDigits allows at most 32 characters; "w" is a 0.5s pause.
+_SEND_DIGITS_MAX = 32
+
+
+def extension_send_digits(extension: str) -> str:
+    """Twilio sendDigits for a known extension: pause EXTENSION_DIAL_DELAY,
+    then the extension and #. Returns "" if the extension has no dialable
+    characters."""
+    digits = re.sub(r"[^0-9*#]", "", extension or "")
+    if not digits:
+        return ""
+    if not digits.endswith("#"):
+        digits += "#"
+    pauses = min(int(EXTENSION_DIAL_DELAY * 2), max(0, _SEND_DIGITS_MAX - len(digits)))
+    return "w" * pauses + digits[:_SEND_DIGITS_MAX]
+
+
+# What a phone menu says when it didn't take the extension. Matched against
+# the menu's last two transcribed turns, since a sentence is often split
+# across them ("...We did not" / "receive an extension").
+_EXTENSION_REJECTED = re.compile(
+    r"(did not|didn't|did n't|have not|haven't)\s+(receive|get|hear|recognize)"
+    r"|not (a )?valid|invalid|not recognized",
+    re.IGNORECASE,
+)
+
+
+def _make_extension_redial_handler(known_extension: str, call_sid: str, call_phase: dict):
+    """Backup for a known extension on a real call: if the phone menu says it
+    didn't receive it, press it again once, with real DTMF (the TwiML
+    redirect). Twilio already pressed it once when the call connected."""
+    redialed = False
+    recent: list[str] = []
+
+    async def on_user_turn_stopped(aggregator, strategy, message):
+        nonlocal redialed
+        if redialed or not known_extension or not call_sid or call_phase.get("mode") in (
+            "opening",
+            "opening_sent",
+            "conversation",
+        ):
+            return
+        text = getattr(message, "content", None) or ""
+        recent.append(text)
+        del recent[:-2]
+        if _EXTENSION_REJECTED.search(" ".join(recent)):
+            redialed = True
+            logger.info(
+                f"Phone menu didn't take extension {known_extension!r} -- pressing it again "
+                f"on call {call_sid} via Twilio's native mechanism"
+            )
+            await _dial_extension_via_call_redirect(call_sid, known_extension)
+
+    return on_user_turn_stopped
 
 
 def _make_on_ivr_status_changed(
@@ -834,35 +921,20 @@ def _make_on_ivr_status_changed(
             await processor.push_frame(LLMSetToolsFrame(tools=NOT_GIVEN), FrameDirection.UPSTREAM)
             if _load_results().get("call_stage", {}).get("value") != "conversation":
                 _save("call_stage", "phone_menu")
-        if status == IVRStatus.DETECTED and known_extension and not dialed:
+        # Real calls: Twilio already pressed the extension when the call was
+        # answered (see EXTENSION_DIAL_DELAY); _make_extension_redial_handler
+        # presses it again if the menu says it didn't get it. Only the local
+        # mic demo dials here, on detection.
+        if status == IVRStatus.DETECTED and known_extension and not dialed and not call_sid:
             dialed = True
-            logger.info(
-                f"IVR detected -- waiting for the prompt to finish before dialing known "
-                f"extension {known_extension!r} (dialing too early, while the system is "
-                f"still playing its greeting, gets ignored even though the tones are sent)"
-            )
-            # See EXTENSION_DIAL_DELAY: timed from the leg connecting, not from
-            # detection.
             await asyncio.sleep(max(0.0, EXTENSION_DIAL_DELAY - (time.monotonic() - leg_started_at)))
-
-            if call_sid:
-                # Real Twilio call -- use the native redirect mechanism, since
-                # in-band audio tones over the Media Stream aren't reliably
-                # recognized as real DTMF by the far end (see docstring above).
-                logger.info(
-                    f"Redirecting call {call_sid} to play real DTMF for extension "
-                    f"{known_extension!r} via Twilio's native mechanism"
-                )
-                await _dial_extension_via_call_redirect(call_sid, known_extension)
-            else:
-                # Local mic demo -- no real telephony/PSTN leg to worry about,
-                # so the in-band tone is fine for a by-ear sanity check.
-                logger.info(f"Dialing known extension {known_extension!r} now (mic demo, in-band tone)")
-                digits_to_dial = known_extension + "#"
-                for i, digit in enumerate(digits_to_dial):
-                    if i > 0:
-                        await asyncio.sleep(0.25)
-                    await processor.push_frame(OutputDTMFUrgentFrame(button=KeypadEntry(digit)))
+            # No PSTN leg in the mic demo, so an in-band tone is fine for a by-ear check.
+            logger.info(f"Dialing known extension {known_extension!r} now (mic demo, in-band tone)")
+            digits_to_dial = known_extension + "#"
+            for i, digit in enumerate(digits_to_dial):
+                if i > 0:
+                    await asyncio.sleep(0.25)
+                await processor.push_frame(OutputDTMFUrgentFrame(button=KeypadEntry(digit)))
 
         if status == IVRStatus.STUCK:
             # Previously this just logged and the call sat there -- the
@@ -948,6 +1020,12 @@ def _build_pipeline(
 
     llm = OpenAILLMService(
         api_key=openai_key,
+        # OpenAI's processing tier for the live conversation. "fast" (same as
+        # "priority") cut the median time to Emily's first word from ~1.2s to
+        # ~0.7s in a test on gpt-6-luna, at priority pricing. Set
+        # OPENAI_SERVICE_TIER=default in .env to go back to standard
+        # processing, or "auto" to use the project's setting.
+        service_tier=os.getenv("OPENAI_SERVICE_TIER", "fast"),
         settings=OpenAILLMService.Settings(
             model="gpt-6-luna",
             temperature=0.3,
@@ -965,14 +1043,14 @@ def _build_pipeline(
 
     leg_started_at = time.monotonic()
     system_prompt = _build_system_prompt(claim_context or DEFAULT_CLAIM_CONTEXT)
-    end_call_schema = make_end_call_schema(call_sid)
-    conversation_tools = [save_field_schema, save_adjuster_info_schema, end_call_schema]
     # Which stage the call is in, shared by the IVR/conversation handlers and
     # ContextTrimmer: "classifying" (who answered?), "ivr", "opening" /
     # "opening_sent" (Emily's first line, no tools), "conversation" (tools on).
     # The mic demo has no classifier step in practice -- Emily speaks first --
     # so it starts at "opening".
-    call_phase = {"mode": "classifying" if call_sid else "opening"}
+    call_phase = {"mode": "classifying" if call_sid else "opening", "rep_turns": 0}
+    end_call_schema = make_end_call_schema(call_sid, call_phase)
+    conversation_tools = [save_field_schema, save_adjuster_info_schema, end_call_schema]
     # No tools until Emily has said her opening line to a person (see
     # ContextTrimmer._maybe_enable_tools) -- the IVR classifier also runs on
     # this context and must not be able to call them either.
@@ -1004,6 +1082,17 @@ def _build_pipeline(
     context_aggregator.user().add_event_handler(
         "on_user_turn_stopped", _on_user_turn_stopped_reset_idle
     )
+    context_aggregator.user().add_event_handler(
+        "on_user_turn_stopped", _make_extension_redial_handler(known_extension, call_sid, call_phase)
+    )
+
+    async def _count_rep_turns(aggregator, *args):
+        # Replies from the person after Emily's opening -- see
+        # MIN_REP_TURNS_TO_END_UNCONFIRMED.
+        if call_phase["mode"] in ("opening_sent", "conversation"):
+            call_phase["rep_turns"] += 1
+
+    context_aggregator.user().add_event_handler("on_user_turn_stopped", _count_rep_turns)
 
     context_trimmer = ContextTrimmer(
         context,

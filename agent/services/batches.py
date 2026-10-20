@@ -21,6 +21,7 @@ from twilio.rest import Client as TwilioClient
 from main import (
     captured_fields,
     clear_results,
+    extension_send_digits,
     load_results,
     outcome_from_captured,
     save_call_outcome_if_unset,
@@ -113,9 +114,14 @@ async def dial_call(destination_number, extension, claim_context, user, call_log
     )
 
     client = TwilioClient(account_sid, auth_token)
+    # A known extension is pressed by Twilio itself, a few seconds after the
+    # call is answered (see main.EXTENSION_DIAL_DELAY for why).
+    send_digits = extension_send_digits(extension)
+    extra = {"send_digits": send_digits} if send_digits else {}
     try:
         call = await asyncio.to_thread(
             client.calls.create,
+            **extra,
             to=destination_number,
             from_=from_number,
             url=f"{base_url}/twiml",

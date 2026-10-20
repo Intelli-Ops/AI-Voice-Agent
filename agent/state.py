@@ -27,12 +27,12 @@ state = {
     "ws_active": 0,
 }
 
-# call_sid -> the known extension to dial for that call. Dialing it triggers
-# a TwiML redirect that disconnects and reconnects /ws for the SAME call, so
-# each new leg could see it again. call_extension_legs counts the legs that
-# have been handed the extension: the first leg dials it; the second one
-# only redials if the phone menu is detected again (e.g. "We did not receive
-# an extension"), and no leg after that gets it -- so it can't loop forever.
+# call_sid -> the known extension for that call. Twilio presses it when the
+# call is answered (sendDigits); a /ws leg that is handed it presses it again
+# -- through a TwiML redirect, which disconnects and reconnects /ws for the
+# SAME call -- only if the menu says it didn't receive it.
+# call_extension_legs counts the legs handed the extension, so at most
+# MAX_EXTENSION_LEGS re-presses can happen and it can't loop forever.
 call_pending_extension: dict[str, str] = {}
 call_extension_legs: dict[str, int] = {}
 MAX_EXTENSION_LEGS = 2

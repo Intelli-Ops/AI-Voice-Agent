@@ -167,11 +167,14 @@ run.py                 Runs the app via uvicorn against the ASGI app (NOT
   re-run for the tool result made her repeat the whole greeting or stall.
   `ContextTrimmer._maybe_enable_tools` switches tools on from the turn
   after the opening.
-- **Known extension timing.** Sent 5s after the /ws leg connects
-  (`EXTENSION_DIAL_DELAY`), not 5s after the menu is detected (detection
-  itself takes ~5s; the test line's menu had given up by then). The
-  second leg may redial once if the menu asks again
-  (`MAX_EXTENSION_LEGS`).
+- **Known extensions are pressed by Twilio itself** (`sendDigits` on the
+  call: 5s pause, then the extension and #; `main.extension_send_digits`).
+  Waiting to recognize the menu and then redirecting took ~9s in total
+  and kept losing to the test line's ~8s menu timeout (logged
+  2026-10-19). Trade-off accepted: if a person answers instead of a menu,
+  they hear the keypad tones. Backup: if the menu says it didn't receive
+  the extension, `_make_extension_redial_handler` presses it again via the
+  TwiML redirect (at most `MAX_EXTENSION_LEGS` times).
 
 ## Environment variables needed (`.env`, never committed)
 

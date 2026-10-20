@@ -180,10 +180,11 @@ Step by step for one batch row:
 4. **WebSocket.** `asgi.py` routes `/ws` to `ws_server.websocket_application`,
    which reads Twilio's `connected` and `start` messages, gets the
    `streamSid`/`callSid`, and starts the Pipecat pipeline for that call.
-5. **IVR.** If a phone menu answers, Pipecat's `IVRNavigator` handles it. With
-   a known extension the app waits 5 s, then makes Twilio play the digits
-   through a TwiML redirect (this disconnects and reconnects the WebSocket for
-   the same call).
+5. **IVR.** If a phone menu answers, Pipecat's `IVRNavigator` handles it. A
+   known extension has already been pressed by Twilio itself, 5 s after the
+   call was answered (`sendDigits`). If the menu says it didn't receive it,
+   the app presses it again through a TwiML redirect (this disconnects and
+   reconnects the WebSocket for the same call).
 6. **Conversation.** When a person answers, Emily runs the script. Each
    confirmed answer is saved by a tool call into `call_results.json`.
 7. **End.** Emily calls `end_call` after her goodbye: the outcome is judged
@@ -409,10 +410,12 @@ and fires two events the app handles:
 
 - **`on_ivr_status_changed`** (`_make_on_ivr_status_changed`):
   - `DETECTED` → turns barge-in off and removes the save tools (the model
-    sometimes called them with junk during menus). If an extension is known
-    (and not yet dialed), waits 5 s for the menu prompt to finish, then dials
-    it through the TwiML redirect (`_dial_extension_via_call_redirect`) — or,
-    in the mic demo, plays in-band DTMF tones.
+    sometimes called them with junk during menus). In the mic demo only, a
+    known extension is dialed here as in-band tones; on real calls Twilio
+    has already pressed it (`extension_send_digits`, passed as `sendDigits`
+    by `dial_call`), and `_make_extension_redial_handler` presses it again
+    through the TwiML redirect (`_dial_extension_via_call_redirect`) if the
+    menu's words say it didn't receive it.
   - `STUCK` → saves outcome `ivr_dead_end_needs_callback`, hangs up the
     Twilio call and ends the pipeline.
 - **`on_conversation_detected`** (`_make_on_conversation_detected`): a human
