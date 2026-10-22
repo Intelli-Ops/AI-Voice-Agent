@@ -379,9 +379,17 @@ audio_out_sample_rate, enable_metrics=True)` and run by a `WorkerRunner`.
   are switched on once a real person is detected.
 - **End of a user turn:** `SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.0)`
   — 1 second of silence ends the turn (0.5 s cut people off mid-sentence).
-- **Silence:** `user_idle_timeout=30`. After 30 s of silence Emily says "Sorry,
-  are you still there?"; on the 3rd consecutive idle period she ends the call
-  (`EndFrame`). Any reply resets the count.
+- **Interruptions:** any sound from the rep stops Emily immediately (CTO's
+  choice: as natural as possible). If the sound produced no English words (a
+  cough, line noise, background talk), she asks "Sorry, did you say
+  something?" (`DID_YOU_SAY_TEXT`); if nothing comes back within
+  `DID_YOU_SAY_WAIT` (3 s) after it, she carries on from where she was cut
+  off. Words in reply take the normal path.
+- **Silence:** `SilenceWatchdog` -- after `SILENCE_CHECKIN_SECONDS` (60 s)
+  with nobody speaking, Emily says "Sorry, are you still there?"; after 3
+  unanswered check-ins the call is ended. Any speech from the rep resets the
+  count. (Pipecat's own idle timer is switched off: it missed silences that
+  began with a noise cutting Emily off.)
 
 ### Context and memory: `ContextTrimmer`
 
@@ -419,9 +427,18 @@ and fires two events the app handles:
   - `STUCK` → saves outcome `ivr_dead_end_needs_callback`, hangs up the
     Twilio call and ends the pipeline.
 - **`on_conversation_detected`** (`_make_on_conversation_detected`): a human
-  answered. Turns barge-in on, restores the three tools, and replaces the LLM
-  messages with Emily's system prompt plus the conversation so far, then
-  runs the LLM so Emily starts her script.
+  answered (decided by the navigator's one classification request). Turns
+  barge-in on, replaces the classifier context with Emily's system prompt
+  plus what the person actually said (`_clean_conversation_history` drops
+  the connect placeholder and `<ivr>`/`<dtmf>`/`<mode>` tags) **without
+  running the LLM**, and speaks the fixed opening line
+  (`build_opening_line`) straight through TTS with a `TTSSpeakFrame`. There
+  is no second LLM request to compose the greeting. Pipecat records the
+  spoken line in the context as Emily's turn; `ContextTrimmer` switches the
+  tools on when it finishes playing (or before the first LLM run after it)
+  and, once, makes sure the line is in the context. A `greeted` flag makes
+  this happen at most once per leg; a person on a later leg of an already
+  greeted call isn't greeted again.
 
 The navigator's goal text comes from `_build_ivr_goal()` (prefer "claims",
 "provider inquiries", "representative"; extension already entered; say why
@@ -523,10 +540,12 @@ plus `call_outcome` once known.
 | Function / class | Purpose |
 |---|---|
 | `ContextTrimmer` | Frame processor that trims and summarizes the LLM context (§8). Methods: `_trim`, `_summarize`, `process_frame`. |
-| `_make_on_conversation_detected(...)` | Handler: human answered → barge-in on, tools back, Emily's prompt in. |
+| `_make_on_conversation_detected(...)` | Handler: human answered → barge-in on, Emily's prompt + the person's words into the context (no LLM run), fixed opening spoken via TTS, once per leg. |
+| `build_opening_line(claim_context)` | Emily's exact opening for one call; quoted in the system prompt and spoken directly on real calls. |
+| `CallTimings`, `CallTimingObserver` | Startup latency per /ws leg; logs one `[STARTUP TIMING]` line (stage durations only, no call content) when the greeting's first audio goes out. |
 | `_dial_extension_via_call_redirect(call_sid, extension)` | Real DTMF via TwiML `<Play digits>` + `<Redirect>`. |
 | `_make_on_ivr_status_changed(...)` | Handler for DETECTED (tools off, dial extension) and STUCK (hang up, `ivr_dead_end_needs_callback`). |
-| `_make_idle_handlers()` | Silence check-ins and the 3rd-time hang-up; counter reset on each user turn. |
+| `SilenceWatchdog` | "Sorry, are you still there?" after `SILENCE_CHECKIN_SECONDS` (default 60) with nobody speaking, during the conversation; ends the call after `SILENCE_MAX_CHECKINS` (3) unanswered. Replaces Pipecat's idle timer, which missed silences that began with a noise cutting Emily off. |
 | `_check_env()` | Exits if a Deepgram/OpenAI/Cartesia variable is missing. |
 | `_build_pipeline(transport, sample_rate, known_extension, enable_vad_interruptions, call_sid, claim_context)` | Builds every service and processor and returns the `PipelineWorker`. |
 | `_run_pipeline(task, on_runner_ready, speak_first)` | Creates the `WorkerRunner`, reports it to the caller (so it can be ended/cancelled), optionally kicks off Emily's first line, runs. |
@@ -536,8 +555,8 @@ plus `call_outcome` once known.
 
 Constants: `RESULTS_FILE`, `DEFAULT_CLAIM_CONTEXT` (demo claim when none is
 given), `REQUIRED_CLAIM_FIELDS`, `EXCEL_CLAIM_COLUMNS`,
-`SUCCESS_REQUIRED_FIELDS`, `ADJUSTER_CONTACT_FIELDS`, `IDLE_PROMPT_TIMEOUT`
-(30 s), `IDLE_MAX_CHECKINS` (3), `REQUIRED_ENV_VARS`.
+`SILENCE_CHECKIN_SECONDS` (60 s), `SILENCE_MAX_CHECKINS` (3),
+`REQUIRED_ENV_VARS`.
 
 ## 11. The Django app
 

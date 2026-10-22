@@ -126,7 +126,9 @@ from loguru import logger  # noqa: E402
 
 logger.add(
     BASE_DIR / "logs" / "agent.log",
-    level="DEBUG",
+    # Same switch as main.py's console output; INFO keeps claim details and
+    # transcripts out of the file (see AGENT_LOG_LEVEL in main.py).
+    level=os.getenv("AGENT_LOG_LEVEL", "DEBUG").upper(),
     rotation="10 MB",
     retention=10,
     enqueue=True,

@@ -6,6 +6,7 @@ only needs that interface) works completely unchanged.
 
 import asyncio
 import json
+import time
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -23,7 +24,9 @@ from .state import (
 )
 
 
-async def _run_call_twilio_bg(websocket, stream_sid, call_sid, extension="", claim_context=None):
+async def _run_call_twilio_bg(
+    websocket, stream_sid, call_sid, extension="", claim_context=None, stream_connected_at=None
+):
     state["call_sid"] = call_sid
     state["ws_active"] += 1
     runners = call_runners.setdefault(call_sid, set())
@@ -49,6 +52,7 @@ async def _run_call_twilio_bg(websocket, stream_sid, call_sid, extension="", cla
             on_runner_ready=on_runner_ready,
             known_extension=extension,
             claim_context=claim_context,
+            stream_connected_at=stream_connected_at,
         )
     except asyncio.CancelledError:
         # Cancelled by batches._cancel_lingering_pipelines: the call was
@@ -90,6 +94,7 @@ async def websocket_application(scope, receive, send):
         start_data = json.loads(await messages.__anext__())
         stream_sid = start_data["start"]["streamSid"]
         call_sid = start_data["start"]["callSid"]
+        stream_connected_at = time.monotonic()  # startup timing: (a) stream established
     except (WebSocketDisconnect, StopAsyncIteration, KeyError):
         return
 
@@ -107,4 +112,5 @@ async def websocket_application(scope, receive, send):
         call_sid,
         extension=extension,
         claim_context=claim_context,
+        stream_connected_at=stream_connected_at,
     )

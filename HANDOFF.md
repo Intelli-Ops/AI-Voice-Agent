@@ -161,12 +161,16 @@ run.py                 Runs the app via uvicorn against the ASGI app (NOT
   busy, call failed, canceled, not called, system error). Judged by
   `main.outcome_from_captured()` from the data captured, however the call
   ended. Labels live in `CallLog.OUTCOME_LABELS`.
-- **Emily's opening line runs with no tools.** With tools attached the
-  model sometimes called one in the same reply as its greeting (saving
-  "claim confirmed" before the rep spoke, or end_call), and Pipecat's
-  re-run for the tool result made her repeat the whole greeting or stall.
-  `ContextTrimmer._maybe_enable_tools` switches tools on from the turn
-  after the opening.
+- **Emily's opening is a fixed line, not an LLM request** (CTO's design,
+  2026-10-21). When the navigator's one classification request says
+  "person", `build_opening_line()` is spoken straight through TTS
+  (`TTSSpeakFrame`); the old second LLM request that composed it is gone
+  (it cost a median 1.04s, p95 1.36s in the logs). No tools during
+  classification or the greeting (the model once saved "claim confirmed" /
+  called end_call alongside an LLM-written greeting, which also made her
+  repeat it); `ContextTrimmer` turns them on after it. Startup timings are
+  logged as one `[STARTUP TIMING]` line per greeted leg. Tests:
+  `python -m unittest discover -s tests`.
 - **Known extensions are pressed by Twilio itself** (`sendDigits` on the
   call: 5s pause, then the extension and #; `main.extension_send_digits`).
   Waiting to recognize the menu and then redirecting took ~9s in total

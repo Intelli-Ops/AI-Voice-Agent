@@ -81,11 +81,15 @@ class CallLog(models.Model):
     OUTCOME_VERIFIED = "verified"
     OUTCOME_CLAIM_NOT_CONFIRMED = "claim_not_confirmed"  # a person answered, claim never confirmed
     OUTCOME_IVR_DEAD_END = "ivr_dead_end_needs_callback"  # stuck in / ended in a phone menu
+    OUTCOME_ENDED_EARLY = "ended_before_anyone_answered"  # connected, but no menu or person ever detected
+    OUTCOME_CALLBACK = "callback_requested"  # asked us to call back another time
     OUTCOME_NOT_CALLED = "not_called"  # batch stopped/interrupted before reaching this row
     OUTCOME_LABELS = {
         OUTCOME_VERIFIED: "Verified",
         OUTCOME_CLAIM_NOT_CONFIRMED: "Claim not confirmed",
         OUTCOME_IVR_DEAD_END: "Stuck in phone menu",
+        OUTCOME_ENDED_EARLY: "Ended before reaching anyone",
+        OUTCOME_CALLBACK: "Asked to call back later",
         "no_answer": "No answer",
         "busy": "Line busy",
         "failed": "Call failed",

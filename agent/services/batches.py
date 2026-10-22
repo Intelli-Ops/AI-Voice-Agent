@@ -73,6 +73,8 @@ JUDGED_OUTCOMES = (
     CallLog.OUTCOME_VERIFIED,
     CallLog.OUTCOME_CLAIM_NOT_CONFIRMED,
     CallLog.OUTCOME_IVR_DEAD_END,
+    CallLog.OUTCOME_ENDED_EARLY,
+    CallLog.OUTCOME_CALLBACK,
 )
 
 
@@ -180,7 +182,7 @@ async def sync_call_results(call_sid: str, call_over: bool):
         if pipeline_outcome:
             outcome = pipeline_outcome
         elif call_over and row.call_outcome in JUDGED_OUTCOMES:
-            outcome = outcome_from_captured(fields, call_stage)
+            outcome = outcome_from_captured(fields, call_stage)  # "" if nothing was ever detected
         else:
             outcome = row.call_outcome
     else:

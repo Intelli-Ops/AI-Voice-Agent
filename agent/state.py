@@ -86,4 +86,5 @@ FIELD_LABELS = {
     "adjuster_fax": "Adjuster Fax",
     "rep_name": "Rep Name",
     "reference_number": "Reference #",
+    "callback_requested": "Callback Requested",
 }

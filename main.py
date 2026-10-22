@@ -22,15 +22,28 @@ try:
     logger.remove(0)
 except ValueError:
     pass  # already removed (e.g. this module imported twice)
-logger.add(sys.stderr, level="DEBUG")
+# AGENT_LOG_LEVEL=INFO hides DEBUG output, which includes Pipecat's dumps of
+# the full LLM context (claim details, transcripts) and the
+# "[IVR RAW LLM TEXT]" lines below -- set it for production. The startup
+# timing lines are INFO and stay visible. Default DEBUG for development.
+LOG_LEVEL = os.getenv("AGENT_LOG_LEVEL", "DEBUG").upper()
+logger.add(sys.stderr, level=LOG_LEVEL)
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.extensions.ivr.ivr_navigator import IVRNavigator, IVRStatus
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    CancelFrame,
     EndFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
     LLMContextFrame,
+    StartFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
     LLMMessagesUpdateFrame,
     LLMRunFrame,
     LLMSetToolsFrame,
@@ -39,6 +52,8 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
 )
 from pipecat.utils.types import NOT_GIVEN
+from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -57,6 +72,7 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.llm_service import FunctionCallParams
+from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
@@ -188,6 +204,29 @@ def load_claims_from_excel(file_path) -> list[dict]:
         wb.close()
 
 
+def _speakable(text: str, limit: int = 120) -> str:
+    """Spreadsheet text made safe to speak and to quote in the prompt:
+    whitespace collapsed, and characters that could read as markup or
+    control tags (<ivr>, SSML, braces) removed."""
+    text = re.sub(r"[<>{}\[\]\x00-\x1f]", " ", str(text or ""))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def build_opening_line(claim_context: dict) -> str:
+    """Emily's exact first line to a person, for one call.
+
+    The single source for it: the system prompt quotes it (Turn 1), and on
+    real calls it is spoken directly through TTS the moment a person is
+    detected, instead of asking the LLM to write it (one fewer LLM request
+    before Emily speaks)."""
+    client = _speakable(claim_context.get("client_name") or DEFAULT_CLAIM_CONTEXT["client_name"])
+    return (
+        "Hi, good afternoon! This call may be recorded for quality and accuracy purposes. "
+        f"My name is Emily, and I'm calling on behalf of {client}. "
+        "Can you verify a patient for me?"
+    )
+
+
 def _build_system_prompt(claim_context: dict) -> str:
     return f"""ROLE
 Your name is Emily. You are calling on behalf of a medical lien management
@@ -196,11 +235,16 @@ for lien purposes. You are speaking with a representative or adjuster at
 the insurance company.
 
 OPENING
-Turn 1: Say this in one natural line, then wait for their reply -- don't
-pause mid-way, just say it and let them respond:
-"Hi, good afternoon! This call may be recorded for quality and accuracy
-purposes. My name is Emily, and I'm calling on behalf of {claim_context["client_name"]}.
-Can you verify a patient for me?"
+Turn 1 (your opening line, exactly):
+"{build_opening_line(claim_context)}"
+On phone calls this line is spoken for you automatically the moment a
+person answers, and it appears in the conversation as your own message.
+If it is already there, NEVER say it again -- continue with Turn 2 based on
+their reply. If it isn't there yet, say it in one natural line and wait.
+If your message shows only PART of that line, they talked over you and that
+is all they heard. Don't restart it word for word: answer what they said,
+and in the same short reply give only what they missed (who you're calling
+on behalf of, and/or the question), then carry on.
 
 Turn 2: Once they say yes/go ahead, give the claim details conversationally
 (not as a rattled-off list) so they can pull up the file: mention the claim
@@ -235,6 +279,10 @@ For the adjuster's contact details (field 3: name, phone, email, fax),
 use save_adjuster_info with all the pieces you have together in ONE call --
 don't call it separately for each piece, since the rep will usually give
 these together.
+
+claim_confirmed means the REP confirmed the claim is on file and matches --
+never save it in the same reply in which you give them the claim details;
+wait for their answer first.
 
 IMPORTANT -- call each field EXACTLY ONCE, not repeatedly:
 Each field (claim_confirmed, claim_status, and the adjuster's info) should
@@ -293,7 +341,8 @@ HANDLING COMMON SITUATIONS
 - If the rep can't find the claim: double-check the DOI and offer to search
   by patient name instead of claim number.
 - If the claim still can't be found or doesn't match after that, or the rep
-  can't or won't give the information: don't keep pressing. Go to the
+  can't or won't give the information, or asks you to call back another
+  time: don't keep pressing. Go to the
   CLOSING below (thank them, ask once for their name and a reference
   number, then say goodbye and call end_call). The call is recorded as
   unverified -- that's a normal outcome, not a failure on your part.
@@ -308,12 +357,16 @@ Turn A: Thank them for their time and ask for their name and a call
 reference number for your records. Then STOP -- do not say goodbye yet,
 wait for their actual reply.
 
-Turn B: After their reply -- WHATEVER it is -- say a short, warm goodbye,
-and in that SAME turn immediately call the end_call tool. If they gave
-their name or a reference number, save them first with save_field
-(rep_name, reference_number). Never combine turn A and turn B into one
-response -- saying goodbye before they've actually answered confuses them
-and makes you sound broken.
+Turn B: Once they've answered -- given their name and/or a reference
+number, said they don't have one, declined, or said goodbye -- say a short,
+warm goodbye, and in that SAME turn immediately call the end_call tool. If
+they gave their name or a reference number, save them first with
+save_field (rep_name, reference_number). Never combine turn A and turn B
+into one response -- saying goodbye before they've actually answered
+confuses them and makes you sound broken.
+A reply like "yes", "sure", "okay" or "well..." to that question is NOT
+the answer -- they are about to tell you. Don't say goodbye; just say
+"Sure, go ahead" (or nothing more) and wait for it.
 
 The rep's name and reference number are nice to have, NOT required. Ask
 for them ONCE only. If the rep doesn't have them, won't give them, ignores
@@ -334,6 +387,10 @@ SITUATIONS).
 
 After your goodbye, never start the call over: don't repeat your opening
 line or the claim details.
+
+If you were cut off, asked "Did you say something?" and got no answer
+(it was just a noise), carry on from where you were cut off -- finish what
+you were saying, don't start over and don't mention the noise.
 
 TONE
 Professional, direct, courteous. Speak in short, clear sentences -- you're on
@@ -426,16 +483,29 @@ def _save(field_name: str, value: str):
 # A call is "verified" when the rep confirmed the claim is on file and
 # matches -- the adjuster's details are collected when available but aren't
 # needed for that. Every other outcome is a reason the claim is unverified.
-def outcome_from_captured(fields: dict, call_stage: str = "") -> str:
-    """verified, or why not: ivr_dead_end_needs_callback (the call ended
-    while still in an automated phone menu) or claim_not_confirmed (a person
-    answered but the claim was never confirmed). fields is {field: value}.
+def outcome_from_captured(fields: dict, call_stage: str | None = None) -> str:
+    """verified, or why not, for a call that connected. fields is
+    {field: value}; call_stage is call_results.json's call_stage.
+
+    - callback_requested: the rep (or a menu) asked us to call back later
+      (see _CALLBACK_REQUEST);
+    - ivr_dead_end_needs_callback: ended while still in an automated menu;
+    - claim_not_confirmed: a person answered, claim never confirmed;
+    - ended_before_anyone_answered: call_stage is "" -- neither a menu nor a
+      person was ever detected (e.g. the line played a carrier message and
+      hung up after 7s before the agent's audio even connected, 2026-10-21);
+    - call_stage None means the stage isn't known (the results file has
+      moved on to another call) -- assume a person, as before.
     Used both when Emily ends the call herself and when it ends any other
     way (the rep hangs up, the silence timeout fires, the menu hangs up)."""
     if fields.get("claim_confirmed"):
         return "verified"
+    if fields.get("callback_requested"):
+        return "callback_requested"
     if call_stage == "phone_menu":
         return "ivr_dead_end_needs_callback"
+    if call_stage == "":
+        return "ended_before_anyone_answered"
     return "claim_not_confirmed"
 
 
@@ -461,6 +531,22 @@ async def save_field(params: FunctionCallParams):
         return
     _save(field_name, value)
     await params.result_callback({"status": "saved", "field_name": field_name})
+
+
+_DIGIT_WORDS = "zero one two three four five six seven eight nine".split()
+
+
+def _read_back(value: str) -> str:
+    """A phone/fax number as words, grouped the usual US way (3-3-4, or
+    1-3-3-4 with a country code). The model was seen reading a saved
+    10-digit fax back with an extra digit; this gives it the exact text."""
+    digits = re.sub(r"[^0-9]", "", value)
+    groups = [digits]
+    if len(digits) == 10:
+        groups = [digits[:3], digits[3:6], digits[6:]]
+    elif len(digits) == 11:
+        groups = [digits[0], digits[1:4], digits[4:7], digits[7:]]
+    return ", ".join(" ".join(_DIGIT_WORDS[int(d)] for d in g) for g in groups)
 
 
 def _phone_digit_issue(value: str) -> str | None:
@@ -507,25 +593,76 @@ async def save_adjuster_info(params: FunctionCallParams):
             }
         )
     else:
-        await params.result_callback({"status": "saved"})
+        saved = _load_results()
+        read_back = {
+            key: _read_back(saved[f"adjuster_{key}"]["value"])
+            for key in ("phone", "fax")
+            if params.arguments.get(key) and f"adjuster_{key}" in saved
+        }
+        result = {"status": "saved"}
+        if read_back:
+            result["read_back"] = read_back
+            result["instruction"] = (
+                "When you repeat a phone or fax number back, say it exactly as in read_back."
+            )
+        await params.result_callback(result)
 
 
-save_field_schema = FunctionSchema(
-    name="save_field",
-    description="Save a single confirmed piece of claim information collected from the insurance rep.",
-    properties={
-        "field_name": {
-            "type": "string",
-            "description": "One of: claim_confirmed, claim_status, rep_name, reference_number",
+def make_save_field_schema(call_phase: dict | None = None) -> FunctionSchema:
+    """The save_field tool. Given the call's phase, claim_confirmed is only
+    accepted once the rep has replied after Emily gave the claim details.
+
+    Observed 2026-10-21: in the same reply in which Emily read out the claim
+    number, DOI and patient, the model also saved claim_confirmed -- before
+    the rep had said anything. The rep then said they couldn't confirm it,
+    but the call was already "Verified". The prompt says to save only what
+    the rep confirms; this makes it impossible to save it any earlier.
+    (call_phase["rep_replied_after_details"] is maintained by
+    _make_turn_tracking_handlers.)"""
+
+    async def handler(params: FunctionCallParams):
+        if (
+            call_phase is not None
+            and params.arguments.get("field_name") == "claim_confirmed"
+            and not call_phase.get("rep_replied_after_details")
+        ):
+            logger.warning(
+                "save_field: claim_confirmed refused -- the rep hasn't replied since the "
+                "claim details were given"
+            )
+            # run_llm=False: no extra model run for this result, so Emily
+            # doesn't speak again before the rep answers.
+            await params.result_callback(
+                {
+                    "status": "not_saved",
+                    "reason": "Nothing is confirmed yet -- you have only just given the claim "
+                    "details. Wait for the rep's answer and save it only if they confirm "
+                    "the claim is on file and matches.",
+                },
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
+        await save_field(params)
+
+    return FunctionSchema(
+        name="save_field",
+        description="Save a single confirmed piece of claim information collected from the insurance rep.",
+        properties={
+            "field_name": {
+                "type": "string",
+                "description": "One of: claim_confirmed, claim_status, rep_name, reference_number",
+            },
+            "value": {
+                "type": "string",
+                "description": "The confirmed value the rep gave for this field.",
+            },
         },
-        "value": {
-            "type": "string",
-            "description": "The confirmed value the rep gave for this field.",
-        },
-    },
-    required=["field_name", "value"],
-    handler=save_field,
-)
+        required=["field_name", "value"],
+        handler=handler,
+    )
+
+
+save_field_schema = make_save_field_schema()  # no phase: no claim_confirmed ordering guard
 
 save_adjuster_info_schema = FunctionSchema(
     name="save_adjuster_info",
@@ -557,9 +694,11 @@ async def hang_up_twilio_call(call_sid: str):
 
 
 # The rep must have replied at least this many times before Emily may hang up
-# on a call where the claim was never confirmed. Stops a premature hang-up
-# early in the call while still letting a "claim not found" call end.
-MIN_REP_TURNS_TO_END_UNCONFIRMED = 3
+# on a call where the claim was never confirmed. It was 3, but a rep can end
+# the call at their first reply ("Not right now. Goodbye." -- seen
+# 2026-10-21), and the model can no longer call tools during its opening
+# (the reason for the guard), so one real reply is enough.
+MIN_REP_TURNS_TO_END_UNCONFIRMED = 1
 
 
 def make_end_call_schema(call_sid: str = "", call_phase: dict | None = None) -> FunctionSchema:
@@ -605,6 +744,7 @@ def make_end_call_schema(call_sid: str = "", call_phase: dict | None = None) -> 
         outcome = outcome_from_captured(captured_fields(results), "conversation")
         logger.info(f"end_call: ending the call ({outcome})")
         save_call_outcome_if_unset(outcome)
+        phase["ended"] = True  # the goodbye auto-hang-up has nothing left to do
         await params.result_callback({"status": "ending_call"})
         if call_sid:
             await hang_up_twilio_call(call_sid)
@@ -642,10 +782,20 @@ class ContextTrimmer(FrameProcessor):
         summarizer_model: str = "gpt-6-luna",
         call_phase: dict | None = None,
         conversation_tools: list | None = None,
+        timings: "CallTimings | None" = None,
+        silence_watchdog: "SilenceWatchdog | None" = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._context = context
+        self._timings = timings
+        self._watchdog = silence_watchdog
+        # Messages trimmed out of the context but not summarized yet. Used to
+        # be summarized only if no summary was already running -- anything
+        # trimmed meanwhile was lost for good, so later in a call the summary
+        # stopped growing ("...asked to verify a patient. The user said
+        # 'Okay.'" four minutes into a call, 2026-10-21).
+        self._pending_summary: list = []
         # Shared with the IVR/conversation handlers in _build_pipeline -- see
         # _maybe_enable_tools.
         self._phase = call_phase if call_phase is not None else {"mode": "conversation"}
@@ -696,10 +846,17 @@ class ContextTrimmer(FrameProcessor):
             cut += 1
         dropped, kept = rest[:cut], rest[cut:]
 
-        if dropped and not self._summarizing:
-            asyncio.create_task(self._summarize(dropped))
+        if dropped:
+            self._pending_summary.extend(dropped)
+            self._maybe_start_summary()
 
         return [system_msg] + extra_system + kept
+
+    def _maybe_start_summary(self):
+        if self._pending_summary and not self._summarizing:
+            batch, self._pending_summary = self._pending_summary, []
+            self._summarizing = True  # set now, so the next frame can't start a second one
+            asyncio.create_task(self._summarize(batch))
 
     async def _summarize(self, dropped_messages: list):
         lines = [
@@ -708,6 +865,8 @@ class ContextTrimmer(FrameProcessor):
             if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m["content"]
         ]
         if not lines:
+            self._summarizing = False
+            self._maybe_start_summary()
             return
 
         self._summarizing = True
@@ -717,7 +876,9 @@ class ContextTrimmer(FrameProcessor):
                 # gpt-6-luna only supports the default temperature (1) -- passing
                 # 0 made every single summarization call fail silently (caught
                 # below), so this has been a no-op since the model switch.
-                max_completion_tokens=60,
+                # 60 was sometimes too few even for one sentence ("max_tokens
+                # ... limit was reached" -> the summary was skipped).
+                max_completion_tokens=150,
                 messages=[
                     {
                         "role": "system",
@@ -734,6 +895,7 @@ class ContextTrimmer(FrameProcessor):
             logger.warning(f"ContextTrimmer: background summarization failed: {exc}")
         finally:
             self._summarizing = False
+            self._maybe_start_summary()  # whatever was trimmed meanwhile
 
     def _maybe_enable_tools(self):
         """Emily's opening line runs with NO tools, then tools come on for
@@ -748,45 +910,429 @@ class ContextTrimmer(FrameProcessor):
         that one reply removes both.
 
         Called for each LLMContextFrame, i.e. each time the model is about to
-        run: the first run after a person is detected is the opening; the
-        next one (after the rep's reply) switches tools on before it goes."""
-        if self._phase["mode"] == "opening":
+        run.
+
+        Real calls: the opening is not an LLM run at all -- it's spoken
+        straight through TTS (see _make_on_conversation_detected), with the
+        phase going greeting_queued -> greeting_speaking. Tools come on when
+        the greeting finishes playing (_on_bot_speaking), or at the latest
+        here, before the first LLM run after it -- which can only be the
+        rep's first reply, possibly spoken over the greeting.
+
+        Mic demo: the opening is still the first LLM run ("opening"); the
+        next one (after the reply) switches tools on before it goes."""
+        mode = self._phase["mode"]
+        if mode == "classifying":
+            if self._timings:
+                self._timings.mark("classification_requested")
+        elif mode == "opening":
             self._phase["mode"] = "opening_sent"
-        elif self._phase["mode"] == "opening_sent":
-            self._context.set_tools(self._conversation_tools)
-            self._phase["mode"] = "conversation"
-            logger.debug("ContextTrimmer: opening line done, tools enabled")
+            self._phase["greeted"] = True
+        elif mode in ("opening_sent", "greeting_queued", "greeting_speaking"):
+            self._enable_conversation_tools(f"LLM run after the opening ({mode})")
+
+    def _enable_conversation_tools(self, why: str):
+        self._context.set_tools(self._conversation_tools)
+        self._phase["mode"] = "conversation"
+        logger.debug(f"ContextTrimmer: tools enabled -- {why}")
+
+    def _on_bot_speaking(self, frame):
+        """Follow the spoken greeting: queued -> speaking -> finished. The
+        output transport sends these frames upstream past this processor
+        when audio actually starts and stops going out to the caller."""
+        self._phase["bot_speaking"] = isinstance(frame, BotStartedSpeakingFrame)
+        mode = self._phase["mode"]
+        if isinstance(frame, BotStartedSpeakingFrame) and mode == "greeting_queued":
+            self._phase["mode"] = "greeting_speaking"
+        elif isinstance(frame, BotStoppedSpeakingFrame) and mode == "greeting_speaking":
+            self._enable_conversation_tools("greeting finished playing")
+
+    def _ensure_opening_in_context(self):
+        """Safety net, once per greeting: before the first LLM run after the
+        spoken opening, make sure the opening is in the context. Pipecat
+        records a spoken TTSSpeakFrame itself (possibly cut short if the rep
+        talked over it); only if that didn't happen is the line inserted --
+        before the rep's latest turn, where it was actually spoken -- so the
+        model never thinks it still has to greet."""
+        line = self._phase.get("opening_line")
+        if not line or self._phase.get("opening_verified"):
+            return
+        self._phase["opening_verified"] = True
+        messages = self._context.get_messages()
+        for m in messages:
+            text = m.get("content") if isinstance(m.get("content"), str) else ""
+            if m.get("role") == "assistant" and text.strip() and line.startswith(text.strip()[:15]):
+                return
+        last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=len(messages))
+        logger.warning("ContextTrimmer: spoken opening wasn't in the context -- adding it")
+        self._context.set_messages(
+            messages[:last_user] + [{"role": "assistant", "content": line}] + messages[last_user:]
+        )
+
+    def _feed_watchdog(self, frame):
+        w = self._watchdog
+        if w is None:
+            return
+        if isinstance(frame, StartFrame):
+            w.start()
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            w.stop()
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            w.activity(user_speaking=True)
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            w.activity(user_speaking=False)
+        elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+            w.activity()
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        self._feed_watchdog(frame)
         self._context.transform_messages(self._trim)
         if isinstance(frame, LLMContextFrame) and direction == FrameDirection.DOWNSTREAM:
             self._maybe_enable_tools()
+            if self._phase["mode"] == "conversation":
+                self._ensure_opening_in_context()
+        elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+            self._on_bot_speaking(frame)
         await self.push_frame(frame, direction)
 
 
-def _make_on_conversation_detected(vad_start_strategy, system_prompt: str, call_phase: dict):
-    """Bind vad_start_strategy/system_prompt/call_phase into the handler via
-    closure, so it can turn real barge-in back on now that a human (not a
-    looping recording) is on the line -- see the comment on
-    enable_vad_interruptions in _build_pipeline for why it starts disabled."""
+# The placeholder user turn the context starts with (see _build_pipeline).
+CALL_CONNECTED_PLACEHOLDER = "(The call has just connected.)"
+_CONTROL_TAG = re.compile(r"<\s*/?\s*(ivr|dtmf|mode)\b", re.IGNORECASE)
+
+
+def _clean_conversation_history(history: list) -> list:
+    """The navigator's saved messages, reduced to what was actually said:
+    user and assistant text only, without the connect placeholder, tool
+    plumbing, or IVR/classifier control tags (<ivr>, <dtmf>, <mode>), which
+    must never reach Emily's conversation."""
+    cleaned = []
+    for message in history or []:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        if not content.strip() or content.strip() == CALL_CONNECTED_PLACEHOLDER:
+            continue
+        if _CONTROL_TAG.search(content):
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
+def _make_on_conversation_detected(
+    vad_start_strategy,
+    system_prompt: str,
+    call_phase: dict,
+    opening_line: str = "",
+    conversation_tools: list | None = None,
+    timings: "CallTimings | None" = None,
+):
+    """Bind the call's state into the handler for "a person answered".
+
+    The navigator's classifier request has already decided "human". Emily's
+    opening is the fixed opening_line (build_opening_line), spoken straight
+    through TTS -- no second LLM request to compose it. Pipecat appends a
+    spoken TTSSpeakFrame to the context as an assistant turn itself, as it is
+    actually spoken (partially, if the rep talks over it), so the next LLM
+    run sees it and carries on with Turn 2.
+    """
 
     async def _on_conversation_detected(processor, conversation_history: list):
-        """A human picked up -- hand off from IVR-navigation mode back to Emily's script."""
-        logger.info("IVR navigator: live conversation detected, resuming normal script")
+        """A human picked up -- hand off from IVR-navigation mode to Emily's script."""
+        # One greeting per leg, however many times this fires. Checked and set
+        # before the first await, so two events can't both get past it (the
+        # event loop doesn't switch tasks between these lines).
+        if call_phase.get("greeted"):
+            logger.info("IVR navigator: person detected again -- already greeted, ignoring")
+            return
+        call_phase["greeted"] = True
+        if timings:
+            timings.mark("human_detected")
+
+        # A previous /ws leg of this same call may already have greeted the
+        # person (call_results.json lives for the whole call).
+        greeted_on_earlier_leg = _load_results().get("call_stage", {}).get("value") == "conversation"
+        logger.info(
+            "IVR navigator: live conversation detected -- "
+            + ("already greeted on an earlier leg, resuming" if greeted_on_earlier_leg else "speaking the opening")
+        )
         vad_start_strategy._enable_interruptions = True
         _save("call_stage", "conversation")
-        # The opening line goes out with no tools; ContextTrimmer switches them
-        # on for the next turn (see ContextTrimmer._maybe_enable_tools).
-        call_phase["mode"] = "opening"
+
+        messages = [{"role": "system", "content": system_prompt}]
+        history = _clean_conversation_history(conversation_history)
+        if greeted_on_earlier_leg:
+            messages += [{"role": "assistant", "content": opening_line}] + history
+            call_phase["mode"] = "conversation"
+            await processor.push_frame(
+                LLMSetToolsFrame(tools=conversation_tools or NOT_GIVEN), FrameDirection.UPSTREAM
+            )
+            await processor.push_frame(
+                LLMMessagesUpdateFrame(messages=messages, run_llm=False), FrameDirection.UPSTREAM
+            )
+            return
+
+        # No tools until the greeting is over (ContextTrimmer switches them on).
+        call_phase["mode"] = "greeting_queued"
+        call_phase["opening_line"] = opening_line  # for ContextTrimmer._ensure_opening_in_context
         await processor.push_frame(LLMSetToolsFrame(tools=NOT_GIVEN), FrameDirection.UPSTREAM)
-        messages = [{"role": "system", "content": system_prompt}] + conversation_history
+        # Replace the classifier's context with Emily's prompt plus what the
+        # person actually said -- without running the LLM.
         await processor.push_frame(
-            LLMMessagesUpdateFrame(messages=messages, run_llm=True),
-            FrameDirection.UPSTREAM,
+            LLMMessagesUpdateFrame(messages=messages + history, run_llm=False), FrameDirection.UPSTREAM
+        )
+        if timings:
+            timings.mark("greeting_requested")
+        await processor.push_frame(
+            TTSSpeakFrame(text=opening_line, append_to_context=True), FrameDirection.DOWNSTREAM
         )
 
     return _on_conversation_detected
+
+
+# Emily's spoken goodbye, and a rep's reply that only closes the call.
+_GOODBYE = re.compile(
+    r"\b(good\s?-?\s?bye|bye(-bye)?|have a (good|great|nice|wonderful|lovely) "
+    r"(day|afternoon|evening|one|weekend))\b",
+    re.IGNORECASE,
+)
+_CLOSING_REPLY = re.compile(
+    r"^\W*((ok(ay)?|alright|sure|yes|yeah|thanks?( you)?|you too|same to you|"
+    r"good\s?-?\s?bye|bye(-bye)?|take care|have a good (one|day))\W*)+$",
+    re.IGNORECASE,
+)
+# The rep (or a recorded message) asking us to call another time. Matched in
+# code rather than left to the model to save, since the model has already
+# skipped tool calls it was told to make (end_call, 2026-10-21).
+_CALLBACK_REQUEST = re.compile(
+    # up to three words in between: "call me a little later" (2026-10-21)
+    r"\b(call|ring|try)(\s+\w+){0,3}?\s+(back|again|later|tomorrow)\b"
+    r"|\b(talk|speak)\s+(to|with)\s+you\s+(later|another time|tomorrow)\b"
+    r"|\bcall(\s+\w+)?\s+(another|some other|a different)\s+(time|day)\b"
+    r"|\b(another|some other|a different)\s+time\b"
+    r"|\bnot\s+(right\s+)?now\b"
+    r"|\b(can't|cannot|can not)\b.{0,40}\b(right now|today|at the moment)\b",
+    re.IGNORECASE,
+)
+
+# When a sound with no words cuts Emily off, she asks this (CTO, 2026-10-22),
+# then waits this long after it has finished playing for an answer before
+# carrying on with what she was saying.
+DID_YOU_SAY_TEXT = "Sorry, did you say something?"
+DID_YOU_SAY_WAIT = 3.0  # seconds
+
+# After Emily's goodbye has finished playing, how long the rep has to say
+# something before the call is hung up.
+GOODBYE_HANGUP_GRACE = 2.0  # seconds
+
+
+def _mentions_claim(text: str, claim_context: dict) -> bool:
+    """Whether text gives the claim's details: its claim number, or the
+    patient's last name."""
+    text = text or ""
+    claim_digits = re.sub(r"\D", "", str(claim_context.get("claim_number", "")))
+    if claim_digits and claim_digits in re.sub(r"\D", "", text):
+        return True
+    last_name = str(claim_context.get("patient_name", "")).strip().split(" ")[-1]
+    return len(last_name) > 2 and last_name.lower() in text.lower()
+
+
+def _make_turn_tracking_handlers(call_sid: str, call_phase: dict, claim_context: dict):
+    """Event handlers that follow what Emily and the rep say, for two
+    decisions that must not be left to the model:
+
+    - claim_confirmed may only be saved once the rep has replied after
+      Emily gave the claim details (see make_save_field_schema);
+    - when Emily has said goodbye and the rep doesn't carry on, the call is
+      hung up here. The prompt tells the model to call end_call with its
+      goodbye, but on 2026-10-21 it said goodbye twice without calling it
+      and both calls stayed open until hung up by hand.
+
+    Returns (on_assistant_turn_stopped, on_user_turn_started,
+    on_user_turn_stopped) for the context aggregators."""
+
+    async def _hang_up_after_goodbye(token, grace: float):
+        # Let the goodbye finish playing, then give the rep a moment.
+        for _ in range(100):  # up to ~20s of speech
+            if not call_phase.get("bot_speaking"):
+                break
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(grace)
+        if call_phase.get("goodbye_token") is not token or call_phase.get("ended"):
+            return  # the rep spoke, Emily said something newer, or end_call ran
+        call_phase["ended"] = True
+        outcome = outcome_from_captured(captured_fields(_load_results()), "conversation")
+        save_call_outcome_if_unset(outcome)
+        logger.info(f"Emily said goodbye and the rep didn't carry on -- hanging up ({outcome})")
+        await hang_up_twilio_call(call_sid)
+
+    def _arm(grace: float):
+        token = object()
+        call_phase["goodbye_token"] = token
+        task = asyncio.create_task(_hang_up_after_goodbye(token, grace))
+        call_phase.setdefault("_tasks", set()).add(task)
+        task.add_done_callback(call_phase["_tasks"].discard)
+
+    async def on_assistant_turn_stopped(aggregator, message):
+        text = getattr(message, "content", None) or ""
+        call_phase["emily_cut_off"] = bool(getattr(message, "interrupted", False))
+        call_phase["goodbye_token"] = None  # anything Emily says replaces an earlier goodbye
+        if _mentions_claim(text, claim_context):
+            call_phase["claim_details_given"] = True
+            call_phase["rep_replied_after_details"] = False
+        if call_sid and call_phase.get("mode") == "conversation" and _GOODBYE.search(text):
+            call_phase["goodbye_said"] = True
+            _arm(GOODBYE_HANGUP_GRACE)
+
+    async def on_user_turn_started(aggregator, *args):
+        call_phase["goodbye_token"] = None  # the rep is still talking: don't hang up
+        # Not cleared here: whether it was an answer is decided when the turn
+        # ends (words -> answer; no words -> carry on).
+
+    async def _ask_did_you_say(aggregator):
+        token = object()
+        call_phase["did_you_say_pending"] = token
+        await aggregator.push_frame(TTSSpeakFrame(text=DID_YOU_SAY_TEXT, append_to_context=True))
+
+        async def carry_on_if_no_answer():
+            await asyncio.sleep(0.5)  # let the question start playing
+            for _ in range(40):  # wait for it to finish (up to ~8s)
+                if not call_phase.get("bot_speaking"):
+                    break
+                await asyncio.sleep(0.2)
+            await asyncio.sleep(DID_YOU_SAY_WAIT)
+            if call_phase.get("did_you_say_pending") is token and not call_phase.get("ended"):
+                call_phase["did_you_say_pending"] = None
+                logger.info("No answer to 'Did you say something?' -- carrying on")
+                await aggregator.push_context_frame()
+
+        task = asyncio.create_task(carry_on_if_no_answer())
+        call_phase.setdefault("_tasks", set()).add(task)
+        task.add_done_callback(call_phase["_tasks"].discard)
+
+    async def on_user_turn_stopped(aggregator, strategy=None, message=None, *args):
+        text = (getattr(message, "content", None) or "").strip()
+        if not text:
+            # Any sound stops Emily at once (CTO: as natural as possible), but
+            # a sound that produced no English words -- a cough, line noise,
+            # "mm", someone talking in the background in another language --
+            # leaves nothing for the LLM to answer, and she used to stay
+            # silent until the rep spoke again (55s once, 2026-10-21). Ask
+            # "Did you say something?"; if nothing comes back, carry on.
+            if call_phase.get("mode") != "conversation" or not aggregator:
+                return
+            if call_phase.get("did_you_say_pending"):
+                # The answer to "Did you say something?" was another noise.
+                call_phase["did_you_say_pending"] = None
+                logger.info("Only noise after 'Did you say something?' -- carrying on")
+                await aggregator.push_context_frame()
+            elif call_phase.get("emily_cut_off"):
+                call_phase["emily_cut_off"] = False
+                logger.info("A sound with no words cut Emily off -- asking 'Did you say something?'")
+                await _ask_did_you_say(aggregator)
+            return
+        call_phase["did_you_say_pending"] = None  # they said something: normal flow
+        if call_phase.get("claim_details_given") or _mentions_claim(text, claim_context):
+            call_phase["rep_replied_after_details"] = True
+        if text and _CALLBACK_REQUEST.search(text) and "callback_requested" not in _load_results():
+            _save("callback_requested", "yes")
+            logger.info("Rep asked us to call back another time")
+        # "Okay, bye" / "Thanks, you too" after Emily's goodbye just closes the call.
+        if call_sid and call_phase.get("goodbye_said") and text and _CLOSING_REPLY.match(text):
+            _arm(0.5)
+
+    return on_assistant_turn_stopped, on_user_turn_started, on_user_turn_stopped
+
+
+class CallTimings:
+    """Startup latency marks for one /ws leg (monotonic clock).
+
+    Only stage names, call/stream ids and durations are logged -- never
+    transcripts, claim details or phone numbers. Each mark keeps its first
+    occurrence. The summary is logged once, when the first audio of the
+    greeting goes out to Twilio."""
+
+    STAGES = (
+        "pipeline_ready",
+        "caller_speech_started",
+        "first_final_transcript",
+        "caller_turn_ended",
+        "classification_requested",
+        "human_detected",
+        "greeting_requested",
+        "first_tts_audio",
+        "first_audio_out",
+    )
+
+    def __init__(self, call_sid: str = "", stream_sid: str = "", connected_at: float | None = None):
+        self.call_sid = call_sid
+        self.stream_sid = stream_sid
+        self.t0 = connected_at if connected_at is not None else time.monotonic()
+        self.marks: dict[str, float] = {}
+        self.reported = False
+
+    def mark(self, name: str):
+        self.marks.setdefault(name, time.monotonic())
+
+    def _gap(self, start: str, end: str) -> str:
+        if start == "stream_connected":
+            begin = self.t0
+        else:
+            begin = self.marks.get(start)
+        finish = self.marks.get(end)
+        if begin is None or finish is None:
+            return "n/a"
+        return f"{finish - begin:.2f}s"
+
+    def summary(self) -> str:
+        parts = [
+            ("stream->pipeline_ready", "stream_connected", "pipeline_ready"),
+            ("stream->caller_speech", "stream_connected", "caller_speech_started"),
+            ("caller_turn_end->classify_request", "caller_turn_ended", "classification_requested"),
+            ("classify_llm", "classification_requested", "human_detected"),
+            ("human->greeting_request", "human_detected", "greeting_requested"),
+            ("tts_first_audio", "greeting_requested", "first_tts_audio"),
+            ("transport", "first_tts_audio", "first_audio_out"),
+            ("TOTAL caller_turn_end->first_audio", "caller_turn_ended", "first_audio_out"),
+            ("TOTAL stream->first_audio", "stream_connected", "first_audio_out"),
+        ]
+        return " | ".join(f"{label} {self._gap(a, b)}" for label, a, b in parts)
+
+    def maybe_report(self):
+        if self.reported or "greeting_requested" not in self.marks or "first_audio_out" not in self.marks:
+            return
+        self.reported = True
+        logger.info(
+            f"[STARTUP TIMING] call={self.call_sid or '-'} stream={self.stream_sid or '-'} | {self.summary()}"
+        )
+
+
+class CallTimingObserver(BaseObserver):
+    """Feeds CallTimings from frames moving through the pipeline. Watching
+    with an observer (a Pipecat public API) keeps measurement out of the
+    audio path itself."""
+
+    def __init__(self, timings: CallTimings, **kwargs):
+        super().__init__(**kwargs)
+        self._timings = timings
+
+    async def on_push_frame(self, data: FramePushed):
+        frame, t = data.frame, self._timings
+        if isinstance(frame, StartFrame) and isinstance(data.source, BaseOutputTransport):
+            t.mark("pipeline_ready")
+        elif isinstance(frame, TranscriptionFrame):
+            t.mark("first_final_transcript")
+        elif isinstance(frame, TTSAudioRawFrame) and "greeting_requested" in t.marks:
+            t.mark("first_tts_audio")
+        elif (
+            isinstance(frame, BotStartedSpeakingFrame)
+            and isinstance(data.source, BaseOutputTransport)
+            and "greeting_requested" in t.marks
+        ):
+            t.mark("first_audio_out")
+            t.maybe_report()
 
 
 async def _dial_extension_via_call_redirect(call_sid: str, extension: str):
@@ -874,6 +1420,8 @@ def _make_extension_redial_handler(known_extension: str, call_sid: str, call_pha
         if redialed or not known_extension or not call_sid or call_phase.get("mode") in (
             "opening",
             "opening_sent",
+            "greeting_queued",
+            "greeting_speaking",
             "conversation",
         ):
             return
@@ -952,38 +1500,86 @@ def _make_on_ivr_status_changed(
     return _on_ivr_status_changed
 
 
-IDLE_PROMPT_TIMEOUT = 30.0  # seconds of total silence before Emily checks in
-IDLE_MAX_CHECKINS = 3  # consecutive silent check-ins (90s+ total) before giving up
+# Silence check-ins (CTO, 2026-10-22: "Emily should speak after a
+# deterministic time, let's say 1 minute, if she doesn't hear back -- 'Are
+# you there?'"). Long silences are normal on these calls ("let me pull that
+# up", holds), so this is generous. After SILENCE_MAX_CHECKINS unanswered
+# check-ins the call is ended.
+SILENCE_CHECKIN_SECONDS = float(os.getenv("SILENCE_CHECKIN_SECONDS", "60"))
+SILENCE_MAX_CHECKINS = int(os.getenv("SILENCE_MAX_CHECKINS", "3"))
+SILENCE_CHECKIN_TEXT = "Sorry, are you still there?"
 
 
-def _make_idle_handlers():
-    """Build the pair of event handlers for user-silence handling.
+class SilenceWatchdog:
+    """Says "Sorry, are you still there?" after SILENCE_CHECKIN_SECONDS in
+    which nobody has spoken, during the conversation with a person.
 
-    Real insurance-rep calls routinely involve long silences the rep
-    themselves asked for -- "let me pull that up," being on hold, searching
-    a system. 15s-then-hangup (the first version of this) was ending real
-    calls out from under genuine in-progress holds. Now: a gentle check-in
-    every 30s of silence, up to 3 in a row (90s+ of total dead air with zero
-    response even to being asked directly) before actually ending the call.
-    Any real reply resets the counter back to zero.
-    """
-    idle_count = 0
+    Replaces Pipecat's user-idle timer, which only starts when Emily stops
+    speaking while the rep isn't mid-turn: when a noise cut Emily off and no
+    words followed, it never started, and Emily stayed silent for 55s until
+    the rep spoke (2026-10-21). This one just measures time since anyone
+    last spoke -- the rep starting or stopping, or Emily starting or
+    stopping -- so every silence is covered, however it began. Fed by
+    ContextTrimmer, which sees those frames go past."""
 
-    async def on_user_idle(aggregator):
-        nonlocal idle_count
-        idle_count += 1
-        if idle_count < IDLE_MAX_CHECKINS:
-            logger.info(f"No response for {IDLE_PROMPT_TIMEOUT}s -- checking in ({idle_count})")
-            await aggregator.push_frame(TTSSpeakFrame(text="Sorry, are you still there?"))
+    def __init__(self, call_sid: str, call_phase: dict, speak, end_call):
+        self._call_sid = call_sid
+        self._phase = call_phase
+        self._speak = speak  # async fn(text): speak a fixed line
+        self._end_call = end_call  # async fn(): end the call
+        self._last_activity = time.monotonic()
+        self._user_speaking = False
+        self._checkins = 0
+        self._task: asyncio.Task | None = None
+
+    def activity(self, *, user_speaking: bool | None = None):
+        self._last_activity = time.monotonic()
+        if user_speaking is not None:
+            self._user_speaking = user_speaking
+            if user_speaking:
+                self._checkins = 0  # they're there
+
+    def start(self):
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    def stop(self):
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def _silent_for(self) -> float:
+        return time.monotonic() - self._last_activity
+
+    async def check(self):
+        """One check; the loop runs this every half second."""
+        if (
+            self._phase.get("mode") != "conversation"
+            or self._phase.get("bot_speaking")
+            or self._user_speaking
+            or self._phase.get("ended")
+            or self._silent_for() < SILENCE_CHECKIN_SECONDS
+        ):
+            return
+        self._checkins += 1
+        self._last_activity = time.monotonic()
+        if self._checkins <= SILENCE_MAX_CHECKINS:
+            logger.info(
+                f"No one has spoken for {SILENCE_CHECKIN_SECONDS:.0f}s -- checking in "
+                f"({self._checkins}/{SILENCE_MAX_CHECKINS})"
+            )
+            await self._speak(SILENCE_CHECKIN_TEXT)
         else:
-            logger.info(f"No response after {idle_count} check-ins -- ending the call")
-            await aggregator.push_frame(EndFrame())
+            logger.info(f"No answer to {SILENCE_MAX_CHECKINS} check-ins -- ending the call")
+            await self._end_call()
 
-    async def on_user_turn_stopped(aggregator, *args):
-        nonlocal idle_count
-        idle_count = 0
-
-    return on_user_idle, on_user_turn_stopped
+    async def _run(self):
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                await self.check()
+        except asyncio.CancelledError:
+            pass
 
 
 REQUIRED_ENV_VARS = ["DEEPGRAM_API_KEY", "OPENAI_API_KEY", "CARTESIA_API_KEY", "CARTESIA_VOICE_ID"]
@@ -1005,10 +1601,12 @@ def _build_pipeline(
     enable_vad_interruptions: bool = True,
     call_sid: str = "",
     claim_context: dict | None = None,
+    timings: CallTimings | None = None,
 ):
     """Build the agent's brain: VAD, STT, LLM, TTS, context, and the pipeline
     itself. The transport (local mic or Twilio WebSocket) is the only thing
     that differs between entry points -- everything else is shared."""
+    timings = timings or CallTimings(call_sid)
     deepgram_key = os.getenv("DEEPGRAM_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     cartesia_key = os.getenv("CARTESIA_API_KEY")
@@ -1043,21 +1641,27 @@ def _build_pipeline(
 
     leg_started_at = time.monotonic()
     system_prompt = _build_system_prompt(claim_context or DEFAULT_CLAIM_CONTEXT)
+    opening_line = build_opening_line(claim_context or DEFAULT_CLAIM_CONTEXT)
     # Which stage the call is in, shared by the IVR/conversation handlers and
-    # ContextTrimmer: "classifying" (who answered?), "ivr", "opening" /
-    # "opening_sent" (Emily's first line, no tools), "conversation" (tools on).
-    # The mic demo has no classifier step in practice -- Emily speaks first --
-    # so it starts at "opening".
-    call_phase = {"mode": "classifying" if call_sid else "opening", "rep_turns": 0}
+    # ContextTrimmer: "classifying" (who answered?), "ivr", "greeting_queued"
+    # / "greeting_speaking" (the fixed opening line playing, no tools),
+    # "conversation" (tools on). The mic demo has Emily speak first with an
+    # LLM-written opening instead: "opening" / "opening_sent".
+    # "greeted" makes the opening happen at most once per leg.
+    call_phase = {
+        "mode": "classifying" if call_sid else "opening",
+        "rep_turns": 0,
+        "greeted": False,
+    }
     end_call_schema = make_end_call_schema(call_sid, call_phase)
-    conversation_tools = [save_field_schema, save_adjuster_info_schema, end_call_schema]
+    conversation_tools = [make_save_field_schema(call_phase), save_adjuster_info_schema, end_call_schema]
     # No tools until Emily has said her opening line to a person (see
     # ContextTrimmer._maybe_enable_tools) -- the IVR classifier also runs on
     # this context and must not be able to call them either.
     context = LLMContext(
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "(The call has just connected.)"},
+            {"role": "user", "content": CALL_CONNECTED_PLACEHOLDER},
         ],
     )
     # Kept as a named variable (not inline) so IVR/conversation-mode handlers
@@ -1074,13 +1678,9 @@ def _build_pipeline(
                 # 0.5s was cutting people off mid-sentence on a normal breath/pause.
                 stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.0)],
             ),
-            user_idle_timeout=IDLE_PROMPT_TIMEOUT,
+            # Pipecat's own idle timer is off (0): SilenceWatchdog does it.
+            user_idle_timeout=0,
         ),
-    )
-    _on_user_idle, _on_user_turn_stopped_reset_idle = _make_idle_handlers()
-    context_aggregator.user().add_event_handler("on_user_turn_idle", _on_user_idle)
-    context_aggregator.user().add_event_handler(
-        "on_user_turn_stopped", _on_user_turn_stopped_reset_idle
     )
     context_aggregator.user().add_event_handler(
         "on_user_turn_stopped", _make_extension_redial_handler(known_extension, call_sid, call_phase)
@@ -1089,23 +1689,55 @@ def _build_pipeline(
     async def _count_rep_turns(aggregator, *args):
         # Replies from the person after Emily's opening -- see
         # MIN_REP_TURNS_TO_END_UNCONFIRMED.
-        if call_phase["mode"] in ("opening_sent", "conversation"):
+        if call_phase["mode"] in ("opening_sent", "greeting_queued", "greeting_speaking", "conversation"):
             call_phase["rep_turns"] += 1
 
     context_aggregator.user().add_event_handler("on_user_turn_stopped", _count_rep_turns)
 
+    async def _mark_turn_started(aggregator, *args):
+        timings.mark("caller_speech_started")
+
+    async def _mark_turn_stopped(aggregator, *args):
+        timings.mark("caller_turn_ended")
+
+    context_aggregator.user().add_event_handler("on_user_turn_started", _mark_turn_started)
+    context_aggregator.user().add_event_handler("on_user_turn_stopped", _mark_turn_stopped)
+
+    _assistant_stopped, _user_started, _user_stopped = _make_turn_tracking_handlers(
+        call_sid, call_phase, claim_context or DEFAULT_CLAIM_CONTEXT
+    )
+    context_aggregator.assistant().add_event_handler("on_assistant_turn_stopped", _assistant_stopped)
+    context_aggregator.user().add_event_handler("on_user_turn_started", _user_started)
+    context_aggregator.user().add_event_handler("on_user_turn_stopped", _user_stopped)
+
+    async def _watchdog_speak(text: str):
+        await context_trimmer.push_frame(TTSSpeakFrame(text=text, append_to_context=True))
+
+    async def _watchdog_end_call():
+        call_phase["ended"] = True
+        save_call_outcome_if_unset(outcome_from_captured(captured_fields(_load_results()), "conversation"))
+        if call_sid:
+            await hang_up_twilio_call(call_sid)
+        else:
+            await context_trimmer.push_frame(EndFrame())
+
+    silence_watchdog = SilenceWatchdog(call_sid, call_phase, _watchdog_speak, _watchdog_end_call)
     context_trimmer = ContextTrimmer(
         context,
         openai_api_key=openai_key,
         max_history_messages=16,
         call_phase=call_phase,
         conversation_tools=conversation_tools,
+        timings=timings,
+        silence_watchdog=silence_watchdog,
     )
 
     ivr_navigator = IVRNavigator(llm=llm, ivr_prompt=_build_ivr_goal(known_extension))
     ivr_navigator.add_event_handler(
         "on_conversation_detected",
-        _make_on_conversation_detected(vad_start_strategy, system_prompt, call_phase),
+        _make_on_conversation_detected(
+            vad_start_strategy, system_prompt, call_phase, opening_line, conversation_tools, timings
+        ),
     )
     ivr_navigator.add_event_handler(
         "on_ivr_status_changed",
@@ -1142,6 +1774,7 @@ def _build_pipeline(
 
     return PipelineWorker(
         pipeline,
+        observers=[CallTimingObserver(timings)],
         params=PipelineParams(
             audio_in_sample_rate=sample_rate,
             audio_out_sample_rate=sample_rate,
@@ -1195,6 +1828,7 @@ async def run_call_twilio(
     on_runner_ready=None,
     known_extension: str = "",
     claim_context: dict | None = None,
+    stream_connected_at: float | None = None,
 ):
     """Real-phone-call entry point, driven by a Twilio Media Streams WebSocket.
 
@@ -1242,6 +1876,7 @@ async def run_call_twilio(
         enable_vad_interruptions=False,
         call_sid=call_sid,
         claim_context=claim_context,
+        timings=CallTimings(call_sid, stream_sid, stream_connected_at),
     )
 
     # Don't force Emily to speak first here -- let the IVR classifier listen
