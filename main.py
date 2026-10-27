@@ -71,6 +71,12 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openrouter.llm import OpenRouterLLMService
+from pipecat.pipeline.llm_switcher import LLMSwitcher
+from pipecat.frames.frames import ManuallySwitchServiceFrame
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import TurnAnalyzerUserTurnStopStrategy
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.frames.frames import FunctionCallResultProperties
 from pipecat.serializers.twilio import TwilioFrameSerializer
@@ -333,6 +339,10 @@ confirm the spelling, that's J-O-H-N-S-O-N, is that right?" Only save it
 once they've confirmed the spelling is correct. For a common, clearly-heard
 name or email, spelling it out isn't necessary -- use judgment, but when in
 doubt, spell it out rather than risk saving it wrong.
+Use ONE spelling for the adjuster's name everywhere: if their email
+contains their name, spell it in the email exactly as the name was spelled
+(name "Stuart Brown" -> stuart.brown@..., not stewart.brown@...), unless the
+rep spells the email out differently.
 
 HANDLING COMMON SITUATIONS
 - If put on hold: say "Sure, I'll hold" and wait silently.
@@ -347,6 +357,11 @@ HANDLING COMMON SITUATIONS
   number, then say goodbye and call end_call). The call is recorded as
   unverified -- that's a normal outcome, not a failure on your part.
 - If interrupted mid-sentence: stop talking immediately and listen.
+- "Stop", "wait", "hold on", "one second", "hang on" mean PAUSE, not "end
+  the call". Stop talking and wait for them; if it's unclear what they want,
+  ask briefly (e.g. "Of course -- should I hold, or call back another
+  time?"). Only close the call when they clearly say they're done, can't
+  help, or ask you to call back.
 
 CLOSING -- this is TWO separate turns, not one:
 Once all fields are collected (or the rep indicates no more info is
@@ -566,9 +581,86 @@ def _phone_digit_issue(value: str) -> str | None:
     )
 
 
+def _soundex(word: str) -> str:
+    """Standard American Soundex: names that sound alike get the same code
+    (Stuart / Stewart -> S363)."""
+    codes = {**dict.fromkeys("bfpv", "1"), **dict.fromkeys("cgjkqsxz", "2"),
+             **dict.fromkeys("dt", "3"), "l": "4", **dict.fromkeys("mn", "5"), "r": "6"}
+    word = re.sub(r"[^a-z]", "", word.lower())
+    if not word:
+        return ""
+    out, last = word[0].upper(), codes.get(word[0], "")
+    for ch in word[1:]:
+        code = codes.get(ch, "")
+        if code and code != last:
+            out += code
+        if ch not in "hw":
+            last = code
+    return (out + "000")[:4]
+
+
+def _same_sound(a: str, b: str) -> bool:
+    return len(a) >= 3 and len(b) >= 3 and abs(len(a) - len(b)) <= 2 and _soundex(a) == _soundex(b)
+
+
+def _align_email_to_name(email: str, name: str) -> str:
+    """Spell a name inside an email address the way the adjuster's name was
+    spelled. 2026-10-22: the rep spelled the name "Stuart", but the email
+    was transcribed from speech as stewart.brown@... -- the same person,
+    two spellings. Only parts that SOUND the same as a name part are changed
+    (Soundex); anything else -- initials, "claims", a nickname like "mike"
+    for Michael, the domain -- is left exactly as heard."""
+    if not email or not name or "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    name_parts = [t.lower() for t in re.findall(r"[A-Za-z]+", name) if len(t) >= 3]
+    pieces = re.split(r"([._+\-]|\d+)", local)
+    for i, piece in enumerate(pieces):
+        if not piece.isalpha() or len(piece) < 3:
+            continue
+        low = piece.lower()
+        if low in name_parts:
+            continue
+        match = next((t for t in name_parts if _same_sound(low, t)), None)
+        if match:
+            pieces[i] = match
+            continue
+        # Run together: "stewartbrown" -> "stuartbrown".
+        for t in name_parts:
+            if low.endswith(t) and low != t:
+                head = low[: -len(t)]
+                fixed = next((u for u in name_parts if u != t and _same_sound(head, u)), None)
+                if fixed:
+                    pieces[i] = fixed + t
+                    break
+            if low.startswith(t) and low != t:
+                tail = low[len(t):]
+                fixed = next((u for u in name_parts if u != t and _same_sound(tail, u)), None)
+                if fixed:
+                    pieces[i] = t + fixed
+                    break
+    return "".join(pieces) + "@" + domain
+
+
 async def save_adjuster_info(params: FunctionCallParams):
     existing = _load_results()
     incomplete_notes = []
+    # One spelling for the adjuster's name, including inside their email.
+    name_for_email = params.arguments.get("name") or existing.get("adjuster_name", {}).get("value", "")
+    email_spelling_note = None
+    email = params.arguments.get("email") or (
+        existing.get("adjuster_email", {}).get("value") if params.arguments.get("name") else None
+    )
+    if email and name_for_email:
+        aligned = _align_email_to_name(email, name_for_email)
+        if aligned != email:
+            logger.info("save_adjuster_info: email spelled to match the adjuster's name")
+            params.arguments["email"] = aligned
+            email_spelling_note = (
+                f"The email was saved as {aligned} -- spelled the same way as the adjuster's "
+                f"name. Read it back once so the rep can correct it if their email really is "
+                f"spelled differently."
+            )
     for key in ("name", "phone", "email", "fax"):
         value = params.arguments.get(key)
         if not value:
@@ -605,6 +697,8 @@ async def save_adjuster_info(params: FunctionCallParams):
             result["instruction"] = (
                 "When you repeat a phone or fax number back, say it exactly as in read_back."
             )
+        if email_spelling_note:
+            result["email_spelling"] = email_spelling_note
         await params.result_callback(result)
 
 
@@ -741,6 +835,18 @@ def make_end_call_schema(call_sid: str = "", call_phase: dict | None = None) -> 
                 }
             )
             return
+        if call_phase is not None and not call_may_end(phase):
+            logger.warning("end_call: refused -- the rep hasn't ended the call and the closing question wasn't asked")
+            await params.result_callback(
+                {
+                    "status": "refused",
+                    "reason": "The rep hasn't said the call is over. Don't end it. If their "
+                    "last words were unclear (like 'stop' or 'wait'), they probably want "
+                    "you to pause -- wait, or ask briefly whether to hold or call back.",
+                },
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+            return
         outcome = outcome_from_captured(captured_fields(results), "conversation")
         logger.info(f"end_call: ending the call ({outcome})")
         save_call_outcome_if_unset(outcome)
@@ -784,6 +890,7 @@ class ContextTrimmer(FrameProcessor):
         conversation_tools: list | None = None,
         timings: "CallTimings | None" = None,
         silence_watchdog: "SilenceWatchdog | None" = None,
+        summarizer_client: AsyncOpenAI | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -804,7 +911,8 @@ class ContextTrimmer(FrameProcessor):
         self._summary = ""
         self._summarizing = False
         self._summarizer_model = summarizer_model
-        self._client = AsyncOpenAI(api_key=openai_api_key)
+        # Creating the client takes ~0.4s; prewarmed services bring their own.
+        self._client = summarizer_client or AsyncOpenAI(api_key=openai_api_key)
 
     def _trim(self, messages: list) -> list:
         if len(messages) <= 1:
@@ -1060,6 +1168,10 @@ def _make_on_conversation_detected(
         )
         vad_start_strategy._enable_interruptions = True
         _save("call_stage", "conversation")
+        switch = _switch_llm(call_phase, "conversation")
+        if switch:
+            # Emily's conversation runs on gpt-6-luna, not the menu model.
+            await processor.push_frame(switch, FrameDirection.UPSTREAM)
 
         messages = [{"role": "system", "content": system_prompt}]
         history = _clean_conversation_history(conversation_history)
@@ -1122,6 +1234,34 @@ _CALLBACK_REQUEST = re.compile(
 # carrying on with what she was saying.
 DID_YOU_SAY_TEXT = "Sorry, did you say something?"
 DID_YOU_SAY_WAIT = 3.0  # seconds
+# After asking once, a wordless sound within this window doesn't make her ask
+# again -- she just carries on (a cough can come in bursts).
+DID_YOU_SAY_COOLDOWN = 20.0  # seconds
+
+# The rep clearly ending or declining the call. Emily may only hang up (her
+# end_call tool, or the goodbye auto-hang-up) once this was said, or once
+# she has reached the normal last step (asking for the rep's name and a
+# reference number). 2026-10-26: the rep said "Stop." in the middle of the
+# questions, the model replied "Understood. Goodbye.", and the auto-hang-up
+# ended a call that should have carried on.
+_REP_ENDING = re.compile(
+    r"\b(good\s?-?\s?bye|bye(-bye)?|that'?s (all|it|everything)|nothing (else|more)|no more"
+    r"|(have|got|need) to go|gotta go|i'?m done|we'?re done|we'?re finished"
+    r"|(can'?t|cannot|can not|won'?t|unable to|not able to|not allowed to)\s+(help|give|share|confirm|"
+    r"provide|find|disclose|release|verify|do)"
+    r"|(don'?t|do not) have (that|it|any|this|the)|no (adjuster|information|info|record)"
+    r"|not (on file|in (our|the) system))\b",
+    re.IGNORECASE,
+)
+# Emily's normal last question: the rep's name and a call reference number.
+_CLOSING_QUESTION = re.compile(r"\breference (number|no\.?|#)", re.IGNORECASE)
+
+
+def call_may_end(call_phase: dict) -> bool:
+    """Whether the conversation has genuinely reached its end (see
+    _REP_ENDING)."""
+    return bool(call_phase.get("closing_asked") or call_phase.get("rep_signalled_end"))
+
 
 # After Emily's goodbye has finished playing, how long the rep has to say
 # something before the call is hung up.
@@ -1162,6 +1302,15 @@ def _make_turn_tracking_handlers(call_sid: str, call_phase: dict, claim_context:
         await asyncio.sleep(grace)
         if call_phase.get("goodbye_token") is not token or call_phase.get("ended"):
             return  # the rep spoke, Emily said something newer, or end_call ran
+        if not call_may_end(call_phase):
+            # A goodbye nothing led up to (the model misread the rep, e.g.
+            # "Stop."). Keep the line open: the rep will usually react, and if
+            # not, the silence check-in still asks and eventually ends it.
+            logger.warning(
+                "Emily said goodbye, but the rep hadn't ended the call and the closing "
+                "question wasn't asked -- not hanging up"
+            )
+            return
         call_phase["ended"] = True
         outcome = outcome_from_captured(captured_fields(_load_results()), "conversation")
         save_call_outcome_if_unset(outcome)
@@ -1182,37 +1331,55 @@ def _make_turn_tracking_handlers(call_sid: str, call_phase: dict, claim_context:
         if _mentions_claim(text, claim_context):
             call_phase["claim_details_given"] = True
             call_phase["rep_replied_after_details"] = False
+        if _CLOSING_QUESTION.search(text):
+            call_phase["closing_asked"] = True
         if call_sid and call_phase.get("mode") == "conversation" and _GOODBYE.search(text):
             call_phase["goodbye_said"] = True
             _arm(GOODBYE_HANGUP_GRACE)
 
     async def on_user_turn_started(aggregator, *args):
         call_phase["goodbye_token"] = None  # the rep is still talking: don't hang up
-        # Not cleared here: whether it was an answer is decided when the turn
-        # ends (words -> answer; no words -> carry on).
+        call_phase["user_speaking"] = True
+        # did_you_say_pending is not cleared here: whether this was an answer
+        # is decided when the turn ends (words -> answer; no words -> carry on).
 
     async def _ask_did_you_say(aggregator):
         token = object()
         call_phase["did_you_say_pending"] = token
+        call_phase["did_you_say_quiet_until"] = time.monotonic() + DID_YOU_SAY_COOLDOWN
         await aggregator.push_frame(TTSSpeakFrame(text=DID_YOU_SAY_TEXT, append_to_context=True))
 
         async def carry_on_if_no_answer():
+            # Carry on only after the question has finished AND there has
+            # been DID_YOU_SAY_WAIT of quiet. If the rep makes any sound,
+            # this stops waiting: when that turn ends, on_user_turn_stopped
+            # decides (words -> answer them; no words -> carry on). It used to
+            # carry on while a second burst of a cough was still going, so
+            # Emily repeated herself and then asked again (2026-10-22).
             await asyncio.sleep(0.5)  # let the question start playing
-            for _ in range(40):  # wait for it to finish (up to ~8s)
-                if not call_phase.get("bot_speaking"):
-                    break
-                await asyncio.sleep(0.2)
-            await asyncio.sleep(DID_YOU_SAY_WAIT)
-            if call_phase.get("did_you_say_pending") is token and not call_phase.get("ended"):
-                call_phase["did_you_say_pending"] = None
-                logger.info("No answer to 'Did you say something?' -- carrying on")
-                await aggregator.push_context_frame()
+            quiet_since = None
+            for _ in range(int((8 + DID_YOU_SAY_WAIT) / 0.1) + 1):
+                if call_phase.get("did_you_say_pending") is not token or call_phase.get("ended"):
+                    return
+                if call_phase.get("user_speaking"):
+                    return  # the turn's end decides
+                if call_phase.get("bot_speaking"):
+                    quiet_since = None
+                else:
+                    quiet_since = quiet_since or time.monotonic()
+                    if time.monotonic() - quiet_since >= DID_YOU_SAY_WAIT:
+                        call_phase["did_you_say_pending"] = None
+                        logger.info("No answer to 'Did you say something?' -- carrying on")
+                        await aggregator.push_context_frame()
+                        return
+                await asyncio.sleep(0.1)
 
         task = asyncio.create_task(carry_on_if_no_answer())
         call_phase.setdefault("_tasks", set()).add(task)
         task.add_done_callback(call_phase["_tasks"].discard)
 
     async def on_user_turn_stopped(aggregator, strategy=None, message=None, *args):
+        call_phase["user_speaking"] = False
         text = (getattr(message, "content", None) or "").strip()
         if not text:
             # Any sound stops Emily at once (CTO: as natural as possible), but
@@ -1226,16 +1393,25 @@ def _make_turn_tracking_handlers(call_sid: str, call_phase: dict, claim_context:
             if call_phase.get("did_you_say_pending"):
                 # The answer to "Did you say something?" was another noise.
                 call_phase["did_you_say_pending"] = None
+                call_phase["emily_cut_off"] = False
                 logger.info("Only noise after 'Did you say something?' -- carrying on")
                 await aggregator.push_context_frame()
             elif call_phase.get("emily_cut_off"):
                 call_phase["emily_cut_off"] = False
-                logger.info("A sound with no words cut Emily off -- asking 'Did you say something?'")
-                await _ask_did_you_say(aggregator)
+                if time.monotonic() < call_phase.get("did_you_say_quiet_until", 0):
+                    # Just asked: 2026-10-22, a cough in two bursts made her
+                    # ask twice. Carry on instead.
+                    logger.info("Another sound with no words right after asking -- carrying on")
+                    await aggregator.push_context_frame()
+                else:
+                    logger.info("A sound with no words cut Emily off -- asking 'Did you say something?'")
+                    await _ask_did_you_say(aggregator)
             return
         call_phase["did_you_say_pending"] = None  # they said something: normal flow
         if call_phase.get("claim_details_given") or _mentions_claim(text, claim_context):
             call_phase["rep_replied_after_details"] = True
+        if _REP_ENDING.search(text) or _CALLBACK_REQUEST.search(text):
+            call_phase["rep_signalled_end"] = True
         if text and _CALLBACK_REQUEST.search(text) and "callback_requested" not in _load_results():
             _save("callback_requested", "yes")
             logger.info("Rep asked us to call back another time")
@@ -1272,6 +1448,7 @@ class CallTimings:
         self.t0 = connected_at if connected_at is not None else time.monotonic()
         self.marks: dict[str, float] = {}
         self.reported = False
+        self.prewarmed = False
 
     def mark(self, name: str):
         self.marks.setdefault(name, time.monotonic())
@@ -1305,7 +1482,8 @@ class CallTimings:
             return
         self.reported = True
         logger.info(
-            f"[STARTUP TIMING] call={self.call_sid or '-'} stream={self.stream_sid or '-'} | {self.summary()}"
+            f"[STARTUP TIMING] call={self.call_sid or '-'} stream={self.stream_sid or '-'} "
+            f"prewarmed={'yes' if self.prewarmed else 'no'} turns={TURN_DETECTION} | {self.summary()}"
         )
 
 
@@ -1434,6 +1612,11 @@ def _make_extension_redial_handler(known_extension: str, call_sid: str, call_pha
                 f"Phone menu didn't take extension {known_extension!r} -- pressing it again "
                 f"on call {call_sid} via Twilio's native mechanism"
             )
+            # The redirect reconnects the stream as a new leg: build its
+            # services now, while Twilio plays the digits.
+            task = asyncio.create_task(prewarm_services(call_sid))
+            call_phase.setdefault("_tasks", set()).add(task)
+            task.add_done_callback(call_phase["_tasks"].discard)
             await _dial_extension_via_call_redirect(call_sid, known_extension)
 
     return on_user_turn_stopped
@@ -1467,6 +1650,9 @@ def _make_on_ivr_status_changed(
             # picks up (ContextTrimmer switches them back on after the opening).
             call_phase["mode"] = "ivr"
             await processor.push_frame(LLMSetToolsFrame(tools=NOT_GIVEN), FrameDirection.UPSTREAM)
+            switch = _switch_llm(call_phase, "menu")
+            if switch:  # a menu again (e.g. after a transfer): back to the fast model
+                await processor.push_frame(switch, FrameDirection.UPSTREAM)
             if _load_results().get("call_stage", {}).get("value") != "conversation":
                 _save("call_stage", "phone_menu")
         # Real calls: Twilio already pressed the extension when the call was
@@ -1594,6 +1780,106 @@ def _check_env():
         )
 
 
+# The person-vs-menu check (and phone-menu navigation) runs on a faster model
+# through OpenRouter; Emily's conversation stays on gpt-6-luna. Measured on
+# the real classifier prompt with transcripts from our calls (2026-10-26):
+# 14/14 correct for both, median 0.92s vs 1.32s. Without OPENROUTER_API_KEY,
+# everything runs on gpt-6-luna as before.
+MENU_LLM_MODEL = os.getenv("MENU_LLM_MODEL", "qwen/qwen3.8-27b")
+
+# "smart": Pipecat's smart-turn model decides from the voice whether the
+# person has finished (a complete "Hello?" ends the turn at once; an
+# unfinished "Well," waits up to SMART_TURN_MAX_WAIT). "timeout": the old
+# fixed rule -- 1.0s of silence ends every turn. TURN_DETECTION in .env.
+TURN_DETECTION = os.getenv("TURN_DETECTION", "smart").lower()
+SMART_TURN_MAX_WAIT = 3.0  # seconds of silence after an unfinished sentence
+
+
+def _make_services(sample_rate: int) -> dict:
+    """The per-leg services that are slow to create (~1.5s together, mostly
+    the Deepgram and OpenAI clients). Built by prewarm_services while the
+    phone is still ringing when possible; otherwise when the call connects.
+    Each set is used by one /ws leg only."""
+    services = {
+        "vad": VADProcessor(vad_analyzer=SileroVADAnalyzer()),
+        "stt": DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), sample_rate=sample_rate),
+        "llm": OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            # OpenAI's processing tier for the live conversation. "fast" (same as
+            # "priority") cut the median time to Emily's first word from ~1.2s to
+            # ~0.7s in a test on gpt-6-luna, at priority pricing. Set
+            # OPENAI_SERVICE_TIER=default in .env to go back to standard
+            # processing, or "auto" to use the project's setting.
+            service_tier=os.getenv("OPENAI_SERVICE_TIER", "fast"),
+            settings=OpenAILLMService.Settings(
+                model="gpt-6-luna",
+                temperature=0.3,
+                max_completion_tokens=120,
+                extra={"reasoning_effort": "none"},
+            ),
+        ),
+        "menu_llm": None,
+        "summarizer_client": AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")),
+        "tts": CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            voice_id=os.getenv("CARTESIA_VOICE_ID"),
+            model="sonic-3.6",
+            sample_rate=sample_rate,
+        ),
+        "smart_turn": LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=SMART_TURN_MAX_WAIT))
+        if TURN_DETECTION == "smart"
+        else None,
+    }
+    if os.getenv("OPENROUTER_API_KEY"):
+        services["menu_llm"] = OpenRouterLLMService(
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            settings=OpenRouterLLMService.Settings(
+                model=MENU_LLM_MODEL,
+                temperature=0.0,
+                max_tokens=60,
+                # Answer directly, no hidden "thinking" first (slow).
+                extra={"extra_body": {"reasoning": {"enabled": False}}},
+            ),
+        )
+    return services
+
+
+# call_sid -> services built ahead of time for that call's next /ws leg.
+_PREWARMED: dict[str, dict] = {}
+
+
+async def prewarm_services(call_sid: str, sample_rate: int = 8000):
+    """Build a leg's services before Twilio connects the audio -- called when
+    the call is placed (it rings for several seconds) and before an
+    extension re-press reconnects the stream. Built in a worker thread so
+    the server keeps serving meanwhile. Takes ~1.5s off the time from the
+    call connecting to Emily being able to hear."""
+    if not call_sid or call_sid in _PREWARMED:
+        return
+    try:
+        _PREWARMED[call_sid] = await asyncio.to_thread(_make_services, sample_rate)
+        logger.debug(f"{call_sid}: services prewarmed for the next leg")
+    except Exception as exc:  # noqa: BLE001 -- the leg just builds its own
+        logger.warning(f"{call_sid}: prewarming failed, the leg will build its own: {exc}")
+
+
+def take_prewarmed(call_sid: str) -> dict | None:
+    return _PREWARMED.pop(call_sid, None)
+
+
+def discard_prewarmed(call_sid: str):
+    _PREWARMED.pop(call_sid, None)
+
+
+def _switch_llm(call_phase: dict, which: str):
+    """Frame that makes the navigator's LLMSwitcher use the menu model
+    ("menu") or gpt-6-luna ("conversation"); None when there's no switcher."""
+    pair = call_phase.get("llms")
+    if not pair:
+        return None
+    return ManuallySwitchServiceFrame(service=pair[which])
+
+
 def _build_pipeline(
     transport,
     sample_rate: int,
@@ -1602,42 +1888,22 @@ def _build_pipeline(
     call_sid: str = "",
     claim_context: dict | None = None,
     timings: CallTimings | None = None,
+    services: dict | None = None,
 ):
     """Build the agent's brain: VAD, STT, LLM, TTS, context, and the pipeline
     itself. The transport (local mic or Twilio WebSocket) is the only thing
-    that differs between entry points -- everything else is shared."""
+    that differs between entry points -- everything else is shared.
+    services: prebuilt by prewarm_services (see _make_services); built here
+    if not given."""
     timings = timings or CallTimings(call_sid)
-    deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+    timings.prewarmed = services is not None
+    services = services or _make_services(sample_rate)
     openai_key = os.getenv("OPENAI_API_KEY")
-    cartesia_key = os.getenv("CARTESIA_API_KEY")
-    cartesia_voice_id = os.getenv("CARTESIA_VOICE_ID")
-
-    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
-
-    stt = DeepgramSTTService(api_key=deepgram_key, sample_rate=sample_rate)
-
-    llm = OpenAILLMService(
-        api_key=openai_key,
-        # OpenAI's processing tier for the live conversation. "fast" (same as
-        # "priority") cut the median time to Emily's first word from ~1.2s to
-        # ~0.7s in a test on gpt-6-luna, at priority pricing. Set
-        # OPENAI_SERVICE_TIER=default in .env to go back to standard
-        # processing, or "auto" to use the project's setting.
-        service_tier=os.getenv("OPENAI_SERVICE_TIER", "fast"),
-        settings=OpenAILLMService.Settings(
-            model="gpt-6-luna",
-            temperature=0.3,
-            max_completion_tokens=120,
-            extra={"reasoning_effort": "none"},
-        ),
-    )
-
-    tts = CartesiaTTSService(
-        api_key=cartesia_key,
-        voice_id=cartesia_voice_id,
-        model="sonic-3.6",
-        sample_rate=sample_rate,
-    )
+    vad, stt, llm, tts = services["vad"], services["stt"], services["llm"], services["tts"]
+    # Real calls: the person-vs-menu check and menu navigation on the faster
+    # menu model, switched to gpt-6-luna once a person answers (see the
+    # handlers). The mic demo has no menu step, so it stays on gpt-6-luna.
+    menu_llm = services["menu_llm"] if call_sid else None
 
     leg_started_at = time.monotonic()
     system_prompt = _build_system_prompt(claim_context or DEFAULT_CLAIM_CONTEXT)
@@ -1652,6 +1918,7 @@ def _build_pipeline(
         "mode": "classifying" if call_sid else "opening",
         "rep_turns": 0,
         "greeted": False,
+        "llms": {"menu": menu_llm, "conversation": llm} if menu_llm else None,
     }
     end_call_schema = make_end_call_schema(call_sid, call_phase)
     conversation_tools = [make_save_field_schema(call_phase), save_adjuster_info_schema, end_call_schema]
@@ -1675,11 +1942,23 @@ def _build_pipeline(
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
                 start=[vad_start_strategy],
-                # 0.5s was cutting people off mid-sentence on a normal breath/pause.
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.0)],
+                # Smart turn (default): the model decides from the voice whether
+                # the person has finished, instead of a fixed 1.0s of silence
+                # after every turn (0.5s had cut people off mid-sentence). In
+                # phone menus the navigator makes VAD wait 2.0s of silence
+                # before it reports speech stopped, and the model only judges
+                # after that, so menu prompts keep their long-pause handling.
+                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=services["smart_turn"])]
+                if services.get("smart_turn")
+                else [SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=1.0)],
             ),
             # Pipecat's own idle timer is off (0): SilenceWatchdog does it.
             user_idle_timeout=0,
+            # How long a turn with speech-like sound but no words lasts before
+            # it is closed (default 5s). That was the pause before "Did you
+            # say something?" after a cough. Turns with words are ended by the
+            # 1.0s speech timeout above, as before.
+            user_turn_stop_timeout=2.5,
         ),
     )
     context_aggregator.user().add_event_handler(
@@ -1730,9 +2009,13 @@ def _build_pipeline(
         conversation_tools=conversation_tools,
         timings=timings,
         silence_watchdog=silence_watchdog,
+        summarizer_client=services.get("summarizer_client"),
     )
 
-    ivr_navigator = IVRNavigator(llm=llm, ivr_prompt=_build_ivr_goal(known_extension))
+    # LLMSwitcher's first service is the active one: the menu model while
+    # classifying / navigating menus.
+    navigator_llm = LLMSwitcher(llms=[menu_llm, llm]) if menu_llm else llm
+    ivr_navigator = IVRNavigator(llm=navigator_llm, ivr_prompt=_build_ivr_goal(known_extension))
     ivr_navigator.add_event_handler(
         "on_conversation_detected",
         _make_on_conversation_detected(
@@ -1784,7 +2067,13 @@ def _build_pipeline(
 
 
 async def _run_pipeline(task, on_runner_ready=None, speak_first: bool = True):
-    runner = WorkerRunner()
+    # handle_sigint=False: Pipecat's runner otherwise installs its own Ctrl+C
+    # handler, which on Windows replaces the whole process's handler with one
+    # that only cancels this call -- after the first call, Ctrl+C in the
+    # run.py terminal stopped reaching the web server ("WorkerRunner ...
+    # interruption detected, cancelling" in the log, server still running).
+    # The server (or, for `python main.py`, asyncio.run) owns Ctrl+C.
+    runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(task)
 
     if on_runner_ready:
@@ -1832,6 +2121,10 @@ async def run_call_twilio(
 ):
     """Real-phone-call entry point, driven by a Twilio Media Streams WebSocket.
 
+    Uses the services prewarmed for this call if there are any; otherwise
+    builds them in a worker thread (not on the event loop, which would stall
+    every other request for ~1.5s).
+
     Args:
         websocket: The FastAPI WebSocket connection Twilio is streaming audio over.
         stream_sid: Twilio's stream identifier from the "start" event.
@@ -1877,6 +2170,7 @@ async def run_call_twilio(
         call_sid=call_sid,
         claim_context=claim_context,
         timings=CallTimings(call_sid, stream_sid, stream_connected_at),
+        services=take_prewarmed(call_sid) or await asyncio.to_thread(_make_services, 8000),
     )
 
     # Don't force Emily to speak first here -- let the IVR classifier listen

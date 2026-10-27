@@ -423,7 +423,8 @@ class GoodbyeHangUpTests(ResultsFileMixin, unittest.IsolatedAsyncioTestCase):
 
         main.hang_up_twilio_call = fake_hang_up
         main.GOODBYE_HANGUP_GRACE = 0.05
-        self.phase = {"mode": "conversation", "rep_turns": 2, "greeted": True}
+        # The call has reached its normal end (closing question asked).
+        self.phase = {"mode": "conversation", "rep_turns": 2, "greeted": True, "closing_asked": True}
         self.assistant_stopped, self.user_started, self.user_stopped = main._make_turn_tracking_handlers(
             "CA_TEST", self.phase, CLAIM
         )
@@ -490,6 +491,51 @@ class GoodbyeHangUpTests(ResultsFileMixin, unittest.IsolatedAsyncioTestCase):
         await self.assistant_stopped(None, Msg(line))
         await self.settle()
         self.assertEqual(self.hung_up, [])
+
+    async def test_goodbye_after_stop_does_not_hang_up(self):
+        # 2026-10-26: rep said "Stop." mid-questions; the model said goodbye.
+        self.phase.pop("closing_asked")
+        await self.user_stopped(None, None, Msg("Stop."))
+        await self.assistant_stopped(None, Msg("Understood. Goodbye."))
+        await self.settle()
+        self.assertEqual(self.hung_up, [])
+
+    async def test_goodbye_after_the_rep_ends_the_call_hangs_up(self):
+        self.phase.pop("closing_asked")
+        await self.user_stopped(None, None, Msg("Sorry, I can't give that out. Bye."))
+        await self.assistant_stopped(None, Msg("No problem, thanks. Goodbye."))
+        await self.settle()
+        self.assertEqual(self.hung_up, ["CA_TEST"])
+
+    async def test_closing_question_counts_as_the_end(self):
+        self.phase.pop("closing_asked")
+        await self.assistant_stopped(None, Msg("Thanks. Could I get your name and a call reference number?"))
+        await self.user_stopped(None, None, Msg("No."))
+        await self.assistant_stopped(None, Msg("No problem. Goodbye."))
+        await self.settle()
+        self.assertEqual(self.hung_up, ["CA_TEST"])
+
+    async def test_end_call_tool_refused_without_an_ending(self):
+        phase = {"mode": "conversation", "rep_turns": 3}
+        tool = main.make_end_call_schema("CA_TEST", phase)
+
+        class P:
+            worker_runner = None
+            result = properties = None
+
+            async def result_callback(self, r, *, properties=None):
+                self.result, self.properties = r, properties
+
+        p = P()
+        await tool.handler(p)
+        self.assertEqual(p.result["status"], "refused")
+        self.assertFalse(p.properties.run_llm)
+        self.assertEqual(self.hung_up, [])
+        phase["rep_signalled_end"] = True
+        p = P()
+        await tool.handler(p)
+        self.assertEqual(p.result["status"], "ending_call")
+        self.assertEqual(self.hung_up, ["CA_TEST"])
 
     async def test_nothing_twice_after_end_call(self):
         self.phase["ended"] = True  # end_call already hung up

@@ -117,6 +117,79 @@ class NoiseInterruptionTests(ResultsFile):
         self.assertTrue(self.phase.get("rep_replied_after_details"))
 
 
+class CoughInBurstsTests(NoiseInterruptionTests):
+    """2026-10-22 log: a cough in two bursts. The second burst cut the
+    question off; the carry-on timer fired while it was still going, so
+    Emily repeated herself, then asked "did you say something?" again."""
+
+    async def test_logged_sequence_now_asks_once_and_carries_on_once(self):
+        await self.assistant_stopped(None, Msg("May I have your name and a call", interrupted=True))
+        await self.user_stopped(self.agg, None, Msg(None))           # burst 1 ends, no words
+        self.assertEqual(self.agg.spoken, [main.DID_YOU_SAY_TEXT])
+        await self.user_started(self.agg)                            # burst 2 starts at once
+        await self.assistant_stopped(None, Msg("Sorry, did", interrupted=True))
+        await asyncio.sleep(1.0)                                     # longer than the wait
+        self.assertEqual(self.agg.context_pushes, 0)                 # not while they're making sound
+        await self.user_stopped(self.agg, None, Msg(None))           # burst 2 ends, no words
+        self.assertEqual(self.agg.context_pushes, 1)                 # carries on once
+        await asyncio.sleep(1.0)
+        self.assertEqual((self.agg.spoken, self.agg.context_pushes), ([main.DID_YOU_SAY_TEXT], 1))
+
+    async def test_another_cough_soon_after_just_carries_on(self):
+        await self.assistant_stopped(None, Msg("Could you give me the", interrupted=True))
+        await self.user_stopped(self.agg, None, Msg(None))
+        await asyncio.sleep(1.0)                                     # no answer -> carried on
+        self.assertEqual(self.agg.context_pushes, 1)
+        await self.assistant_stopped(None, Msg("Could you give me the adjuster's", interrupted=True))
+        await self.user_stopped(self.agg, None, Msg(None))           # cough again, within 20s
+        self.assertEqual(self.agg.spoken, [main.DID_YOU_SAY_TEXT])   # not asked a second time
+        self.assertEqual(self.agg.context_pushes, 2)
+
+
+class EmailSpellingTests(ResultsFile):
+    """2026-10-22: name spelled "Stuart", email saved as stewart.brown@..."""
+
+    def test_alignment(self):
+        a = main._align_email_to_name
+        self.assertEqual(a("stewart.brown@mlm.com", "Stuart Brown"), "stuart.brown@mlm.com")
+        self.assertEqual(a("stewartbrown@mlm.com", "Stuart Brown"), "stuartbrown@mlm.com")
+        self.assertEqual(a("sbrown@mlm.com", "Stuart Brown"), "sbrown@mlm.com")          # initial kept
+        self.assertEqual(a("mike.adams@x.com", "Michael Adams"), "mike.adams@x.com")     # nickname kept
+        self.assertEqual(a("claims@insurer.com", "Stuart Brown"), "claims@insurer.com")  # not a name
+        self.assertEqual(a("stuart.brown@stewart.com", "Stuart Brown"), "stuart.brown@stewart.com")  # domain untouched
+
+    async def save(self, **args):
+        class P:
+            arguments = dict(args)
+            result = None
+
+            async def result_callback(self, result, **kw):
+                self.result = result
+
+        p = P()
+        await main.save_adjuster_info(p)
+        return p.result
+
+    async def test_name_and_email_together(self):
+        result = await self.save(name="Stuart Brown", email="stewart.brown@mlm.com")
+        self.assertEqual(main._load_results()["adjuster_email"]["value"], "stuart.brown@mlm.com")
+        self.assertIn("Read it back once", result["email_spelling"])
+
+    async def test_email_given_after_the_name(self):
+        await self.save(name="Stuart Brown")
+        await self.save(email="stewart.brown@mlm.com")
+        self.assertEqual(main._load_results()["adjuster_email"]["value"], "stuart.brown@mlm.com")
+
+    async def test_name_given_after_the_email(self):
+        await self.save(email="stewart.brown@mlm.com")
+        await self.save(name="Stuart Brown")
+        self.assertEqual(main._load_results()["adjuster_email"]["value"], "stuart.brown@mlm.com")
+
+    async def test_matching_spelling_gets_no_note(self):
+        result = await self.save(name="Stuart Brown", email="stuart.brown@mlm.com")
+        self.assertNotIn("email_spelling", result)
+
+
 class ReadBackTests(ResultsFile):
     def test_groups(self):
         self.assertEqual(main._read_back("1123345676"), "one one two, three three four, five six seven six")
@@ -165,6 +238,29 @@ class SummarizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("m2-0", calls[1])
         self.assertEqual(trimmer._summary, "part1. part2.")
+
+
+class CtrlCTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pipeline_runner_does_not_take_over_ctrl_c(self):
+        seen = {}
+
+        class FakeRunner:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            async def add_workers(self, *a):
+                pass
+
+            async def run(self):
+                pass
+
+        orig = main.WorkerRunner
+        main.WorkerRunner = FakeRunner
+        try:
+            await main._run_pipeline(object(), speak_first=False)
+        finally:
+            main.WorkerRunner = orig
+        self.assertIs(seen.get("handle_sigint"), False)
 
 
 class ClosingPromptTests(unittest.TestCase):

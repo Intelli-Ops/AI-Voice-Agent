@@ -66,7 +66,9 @@ This project is an AI agent, called **Emily**, that makes those calls:
 | Language model (LLM) | **OpenAI** | **`gpt-6-luna`**, temperature 0.3, max 120 output tokens, `reasoning_effort: none` | `_build_pipeline()` |
 | Text-to-speech (TTS) | **Cartesia** | **`sonic-3.6`**, voice from `CARTESIA_VOICE_ID` | `_build_pipeline()` |
 | Voice activity detection (VAD) | **Silero VAD** (runs locally on CPU via onnxruntime) | `SileroVADAnalyzer()` defaults | `_build_pipeline()` |
-| Call-history summarizer | **OpenAI** | `gpt-6-luna`, max 60 tokens | `ContextTrimmer` in `main.py` |
+| Person-vs-menu check and menu navigation | **OpenRouter** | `qwen/qwen3.8-27b` (`MENU_LLM_MODEL`), no reasoning; switched to gpt-6-luna (`LLMSwitcher`) once a person answers. Off without `OPENROUTER_API_KEY` | `_make_services()` |
+| Turn detection | **Pipecat smart turn v3** (local ONNX) | decides from the voice when the rep has finished; `TURN_DETECTION=timeout` restores the fixed 1.0 s | `_make_services()` |
+| Call-history summarizer | **OpenAI** | `gpt-6-luna`, max 150 tokens | `ContextTrimmer` in `main.py` |
 | IVR navigation | Same OpenAI LLM, driven by Pipecat's `IVRNavigator` | — | `_build_pipeline()` |
 
 Notes:
@@ -384,7 +386,9 @@ audio_out_sample_rate, enable_metrics=True)` and run by a `WorkerRunner`.
   cough, line noise, background talk), she asks "Sorry, did you say
   something?" (`DID_YOU_SAY_TEXT`); if nothing comes back within
   `DID_YOU_SAY_WAIT` (3 s) after it, she carries on from where she was cut
-  off. Words in reply take the normal path.
+  off. Words in reply take the normal path. She waits while the rep is still
+  making sound, and asks at most once per 20 s (`DID_YOU_SAY_COOLDOWN`); a
+  wordless sound is recognized after 2.5 s (`user_turn_stop_timeout`).
 - **Silence:** `SilenceWatchdog` -- after `SILENCE_CHECKIN_SECONDS` (60 s)
   with nobody speaking, Emily says "Sorry, are you still there?"; after 3
   unanswered check-ins the call is ended. Any speech from the rep resets the
@@ -487,8 +491,8 @@ patient. It defines:
 | Tool | Arguments | What it does |
 |---|---|---|
 | `save_field` | `field_name` (claim_confirmed, claim_status, rep_name, reference_number), `value` | Saves one field to `call_results.json`. Ignores a repeat of a field already saved. |
-| `save_adjuster_info` | `name`, `phone`, `email`, `fax` (all optional) | Saves the adjuster's details in one call. A phone/fax with fewer than 10 digits is **not** saved; returns `status: partial` with instructions to ask for the rest. |
-| `end_call` | — | Refuses unless `claim_confirmed` is saved (stops the model hanging up on its first turn). Otherwise saves the outcome (judged from captured data), hangs up the Twilio call via REST, and ends the pipeline. |
+| `save_adjuster_info` | `name`, `phone`, `email`, `fax` (all optional) | Saves the adjuster's details in one call. A name inside the email is spelled the same way as the adjuster's name when they sound alike (`_align_email_to_name`, Soundex: stewart.brown@ -> stuart.brown@ for "Stuart Brown"); Emily reads it back once. A phone/fax with fewer than 10 digits is **not** saved; returns `status: partial` with instructions to ask for the rest. |
+| `end_call` | — | Refuses unless `claim_confirmed` is saved (stops the model hanging up on its first turn). Otherwise saves the outcome (judged from captured data), hangs up the Twilio call via REST, and ends the pipeline. | Also refused (and the goodbye auto-hang-up skipped) unless the call has really ended: Emily asked for the rep's name/reference number, or the rep said something that ends a call (`_REP_ENDING`: bye, that's all, have to go, can't give that out, call back later…). "Stop"/"wait" alone never ends a call.
 
 Each tool is a Pipecat `FunctionSchema` with an async handler receiving
 `FunctionCallParams` and replying through `params.result_callback(...)`.

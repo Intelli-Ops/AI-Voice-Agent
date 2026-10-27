@@ -21,7 +21,9 @@ from twilio.rest import Client as TwilioClient
 from main import (
     captured_fields,
     clear_results,
+    discard_prewarmed,
     extension_send_digits,
+    prewarm_services,
     load_results,
     outcome_from_captured,
     save_call_outcome_if_unset,
@@ -138,6 +140,11 @@ async def dial_call(destination_number, extension, claim_context, user, call_log
         return None, str(exc)
 
     state["dialed_call_sid"] = call.sid
+    # Build Emily's services while the phone rings, so they're ready the
+    # moment the call connects.
+    task = asyncio.create_task(prewarm_services(call.sid))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
     call_pending_extension[call.sid] = extension
     call_claim_context[call.sid] = claim_context
 
@@ -225,6 +232,7 @@ async def record_twilio_terminal_status(call_sid: str, twilio_status: str):
     if outcome is None or not call_sid:
         return
     call_terminal_status[call_sid] = twilio_status
+    discard_prewarmed(call_sid)  # unused if the call never connected
 
     # A late callback for an earlier call must not touch the current call's
     # live state. dialed_call_sid is None after a server restart, in which
